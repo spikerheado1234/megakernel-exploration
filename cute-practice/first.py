@@ -60,18 +60,31 @@ def adder_composition(a: cute.Tensor, b: cute.Tensor, answer: cute.Tensor, tv_la
 
     print(f'a layout: {a}')
     print(f'b layout: {b}')
+    print(f'a shape: {a.shape}')
+    print(f'b shape: {b.shape}')
+
+    ## This prints out per thread, block information. ##
+    #cute.printf('tidx: {}, bidx: {}', tidx, bidx)
 
     ## We index this manually. ##
 
-    idx = ((tidx, None), bidx)
+    ## We unpack the bidx. ##
+    m, n = a.shape[1]
+    mi = bidx // n
+    ni = bidx % n
+
+    idx = ((None, None), (mi, ni))
 
     ## I don't think cute composition is needed here. ##
-    fragA = a[idx].load()
-    fragB = b[idx].load()
+    cA = cute.composition(a[idx], tv_layout)
+    cB = cute.composition(b[idx], tv_layout)
+    cC = cute.composition(answer[idx], tv_layout)
+
+    print(f'a[idx]: {a[idx]} composition cA: {cA}')
 
     ## Alternative cute-composition method. ##
 
-    answer[idx] = fragA + fragB
+    cC[(tidx, None)] = cA[(tidx, None)].load() + cB[(tidx, None)].load()
 
 @cute.jit
 def wrapper(a_: cute.Tensor, b_: cute.Tensor, answer_: cute.Tensor):
@@ -88,7 +101,7 @@ def wrapper(a_: cute.Tensor, b_: cute.Tensor, answer_: cute.Tensor):
 
     ## Here is a sample vectorized addition kernel. ##
 
-    gA = cute.zipped_divide(a_, (1, 8)) ## Layout here: (1, 8),(16, 2) : (8, 1),(16,8). or are the strides (16, 1) (16, 8) ? I think it's the former.
+    gA = cute.zipped_divide(a_, (1, 8)) ## Layout here: (1, 8),(16, 2) : (0, 1),(16,8). 
     gB = cute.zipped_divide(b_, (1, 8)) ## Same layout as ^.
     answer = cute.zipped_divide(answer_, (1, 8)) ## Same layout as ^.
 
@@ -113,17 +126,20 @@ def wrapper_tv(a_: cute.Tensor, b_: cute.Tensor, c_: cute.Tensor):
     thr_layout = cute.make_layout((4, 32), stride=(32, 1))
     val_layout = cute.make_layout((4, 8), stride=(8, 1))
 
+    ## So what excatly is tiler_mn and tv_layout and their relationship? ##
     tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
 
     print(f'tiler_mn: {tiler_mn}, tv_layout: {tv_layout}')
 
     gA = cute.zipped_divide(a_, tiler_mn)
     gB = cute.zipped_divide(b_, tiler_mn)
-    gc = cute.zipped_divide(c_, tiler_mn)
+    gC = cute.zipped_divide(c_, tiler_mn)
+
+    print(f'grid size: {cute.size(gA, mode=[1])}')
 
     adder_composition(gA, gB, gC, tv_layout).launch(
             grid=[cute.size(gA, mode=[1]), 1, 1],
-            block=[cute.size(tv_layout, mode=[1]), 1, 1]
+            block=[cute.size(tv_layout, mode=[0]), 1, 1]
             )
 
 if __name__ == '__main__':
@@ -135,9 +151,7 @@ if __name__ == '__main__':
     b_ = from_dlpack(two)
     answer_ = from_dlpack(answer)
 
-    comp_func = cute.compile(wrapper, a_, b_, answer_)
-    for _ in range(10):
-        comp_func(a_, b_, answer_)
+    comp_func = cute.compile(wrapper_tv, a_, b_, answer_)
 
     ## Timing in case it's needed. ##
     start = torch.cuda.Event(enable_timing=True)
@@ -154,5 +168,6 @@ if __name__ == '__main__':
 
     comp_func(a_, b_, answer_)
 
+    print(f'is close: {torch.allclose(one+two, answer)}')
     print('terminated successful!')
 
