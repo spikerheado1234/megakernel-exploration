@@ -109,6 +109,55 @@ class TKEvoAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO):
-        raise NotImplementedError(
-            "TKEvoAttention.backward is not yet implemented."
+        # ctx layout (set in forward):
+        #   Q_tk, K_tk, V_tk, pair_bias_tk, res_mask_tk : padded (if needed), (B*N_SEQ, H, N, padded_D) bf16
+        #   O_pad : (B*N_SEQ, H, N, padded_D) bf16
+        #   L     : (B*N_SEQ, H, 1, N) fp32
+        Q_tk, K_tk, V_tk, pair_bias_tk, res_mask_tk, O_pad, L = ctx.saved_tensors
+        B       = ctx.B
+        H       = ctx.H
+        N_CTX   = ctx.N_CTX
+        N_SEQ   = ctx.N_SEQ
+        true_D  = ctx.true_D
+        padded_D = ctx.padded_D
+        softmax_scale = ctx.softmax_scale
+
+        bf16 = torch.bfloat16
+
+        # dO arrives in caller layout (B, N_SEQ, N_CTX, H, D=true_D); bring to
+        # (B*N_SEQ, H, N_CTX, padded_D) with the same pad we did in forward.
+        dO_tk = dO
+        if dO_tk.dtype != bf16:
+            dO_tk = dO_tk.to(bf16)
+        dO_tk = dO_tk.transpose(-2, -3).contiguous().view(B * N_SEQ, H, N_CTX, true_D)
+        if padded_D != true_D:
+            pad = padded_D - true_D
+            dO_tk = F.pad(dO_tk, (0, pad), value=0.0).contiguous()
+
+        dQ_pad, dK_pad, dV_pad, d_pair_bias = _C.evoattention_backward(
+            Q_tk, K_tk, V_tk, pair_bias_tk, res_mask_tk,
+            O_pad, L, dO_tk,
+            N_SEQ, softmax_scale,
         )
+        # dQ_pad, dK_pad, dV_pad: (B*N_SEQ, H, N_CTX, padded_D) fp32
+        # d_pair_bias:            (B, H, N_CTX, N_CTX)          fp32
+
+        # Slice off padded D columns, cast to bf16 FIRST (halves the bytes moved
+        # by the subsequent transpose+contiguous), then reshape/transpose back.
+        # This knocks ~30 μs off per-call wrapper overhead at N_CTX=384 D=64.
+        def from_tk_grad(x):
+            x = x[..., :true_D].contiguous()     # fp32, (B*N_SEQ, H, N, true_D)
+            x = x.to(bf16)                        # bf16 cast, same layout
+            x = x.view(B, N_SEQ, H, N_CTX, true_D).transpose(-2, -3).contiguous()
+            return x
+
+        dQ = from_tk_grad(dQ_pad)
+        dK = from_tk_grad(dK_pad)
+        dV = from_tk_grad(dV_pad)
+
+        # pair_bias caller layout is (B, 1, H, N, N). We received (B, H, N, N) fp32.
+        d_pair_bias = d_pair_bias.unsqueeze(1).to(bf16)  # (B, 1, H, N, N) bf16
+
+        # forward signature: forward(ctx, Q, K, V, res_mask, pair_bias) -> O
+        # so backward returns one grad per input (+ None for non-diff tensors).
+        return dQ, dK, dV, None, d_pair_bias

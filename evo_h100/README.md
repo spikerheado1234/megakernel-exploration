@@ -11,11 +11,17 @@ The Triton reference it matches semantically is at
 `_attn_fwd` + `EvoformerAttention.forward`).
 
 Files:
-- `tk_evoattention.cu` — CUDA kernel and `torch` C++ extension (PyBind).
+- `tk_evoattention.cu` — CUDA kernels (forward + backward + bwd-prep) and
+  `torch` C++ extension (PyBind). Both `evoattention_forward` and
+  `evoattention_backward` are exposed.
 - `tk_evo_attention_layer.py` — `torch.autograd.Function` wrapper
-  (`TKEvoAttention`) that handles reshape / cast / D padding.
-- `test_tk_evoattention.py` — correctness tests vs. the Triton reference.
-- `benchmark.py` — forward-pass speed comparison vs. Triton.
+  (`TKEvoAttention`) that handles reshape / cast / D padding for both the
+  forward and backward paths.
+- `test_tk_evoattention.py` — forward correctness tests vs. Triton.
+- `test_tk_evoattention_bwd.py` — backward correctness tests vs. Triton
+  (compares dQ, dK, dV, d_pair_bias at `atol=1e-2, rtol=2e-2`).
+- `benchmark.py` — speed comparison vs. Triton in three modes: `fwd`, `bwd`,
+  and `full` (fwd + bwd end-to-end). Mirrors `~/MegaFold/benchmarks/evoattention_speed.py`.
 - `Makefile` — builds the PyTorch C++ extension (`_C.cpython-*.so`).
 
 ## 1. What the reference kernel does (semantics we must match)
@@ -49,7 +55,7 @@ bias** (rank-4), and there **is an additive residue mask** (rank-1 along KV)
    multiply; that's fine for plain QK but impossible once pair-bias is mixed
    in (the bias would get multiplied by `scale` too).
 
-## 3. Changes introduced in `tk_evoattention.cu`
+## 3. Forward kernel changes in `tk_evoattention.cu`
 
 ### 3.1 Shape convention (5-D → 4-D folding)
 
@@ -234,13 +240,16 @@ on registers only, is much faster.
   (is_causal)` branches are gone.
 - **GQA / hr > 1** — the kernel requires `qo_heads == kv_heads` (just set
   `kv_head_idx = head_idx`). Pair-bias is indexed per QO head anyway.
-- **Backward kernel and dispatch** — this file is forward-only.
 
 ### 3.9 `L` (logsumexp) output
 
-Still produced per query row, now in natural-log space as `max*ln(2) + ln(l_i)`
-(recall `max_vec` is in base-2 units). Currently unused; reserved for when the
-backward kernel lands.
+Produced per query row in natural-log space as `max*ln(2) + ln(l_i)` (recall
+`max_vec` is in base-2 units). This is the plain natural-log LSE
+`ln(sum_kv exp(logits[q, kv]))`, which the backward kernel (§4) then
+reconstructs P^T from directly — without the `-1/softmax_scale` post-multiply
+that `mha_h100`'s forward applies. Keeping L format decoupled from
+`softmax_scale` is important for the D-padding path (§5), where the scale
+varies per call.
 
 ### 3.10 Host-side API changes
 
@@ -251,9 +260,256 @@ backward kernel lands.
   shared pair_bias indexing.
 - `softmax_scale` is an optional positive override; when `<= 0` the kernel
   uses `1/sqrt(head_dim)`. The override is needed when the caller zero-pads
-  the head dim (see §4).
+  the head dim (see §5).
 
-## 4. Python-side padding for non-native head dims (D ∈ {16, 32, 96})
+## 4. Backward kernel changes in `tk_evoattention.cu`
+
+The backward pass is adapted from the H100 MHA backward at
+`kernels/attention/mha_h100/mha_h100.cu` — *not* rewritten. All the
+scaffolding of the base kernel is inherited unchanged: warp specialisation
+(1 producer + 1 consumer warpgroup), tic/toc double-buffering of Q / dO /
+L / D, per-stage semaphores, the `mm_AtB(qg_reg, ds_smem, k_smem)` trick for
+dQ, and the separate `bwd_prep` kernel that computes `D[q] = sum_d(dO·O)`.
+
+Two new kernels live alongside the forward in `tk_evoattention.cu`:
+
+- `evo_bwd_prep_ker` — copy of `bwd_attend_prep_ker` with the evoattention
+  4-D shape `(B*N_SEQ, H, N, D)` instead of `(B, H, N, D)`. Produces `D`
+  of shape `(B*N_SEQ, H, 1, N)` fp32.
+- `evo_bwd_ker` — the main backward.
+
+This section only documents what changed relative to `bwd_attend_ker`.
+
+### 4.1 Parallel scheme and tile config
+
+Grid: `dim3(N_CTX / (CW * tile_h), H, B*N_SEQ)`. Each CTA fixes a KV range
+and iterates over all Q tiles (kv-outer, q-inner — same as `mha_h100`'s bwd).
+
+Tile config (`CW` = consumer warpgroups, per-D):
+
+| D   | CW | smem ≈ | rationale                                                    |
+|-----|----|--------|--------------------------------------------------------------|
+| 64  | 2  | ~132 KB| matches `mha_h100`'s CW=2; halves CTA count; 2× `dK`/`dV` per CTA |
+| 128 | 1  | ~154 KB| CW=2 at D=128 would push smem over the 226 KB budget (k/v/q/og/qg all double their per-D footprint) |
+
+Layout constants (both D):
+```
+tile_h    = 64      // kv rows per consumer warpgroup
+tile_h_qo = 64      // q rows per iteration
+stages    = 2       // tic/toc for Q, og, L, D, pair_bias
+```
+
+Each CTA fixes a (kv_block × CW × tile_h) range of KV rows and iterates
+over all Q tiles. At CW=2 a single CTA produces dK, dV for 128 kv rows at
+a time, reducing CTA count and letting the producer amortise k/v/rm TMAs
+across both warpgroups. At CW=1 (D=128) each CTA owns 64 kv rows.
+
+### 4.2 New shared-memory buffers
+
+On top of the base kernel's allocations (scaled by `CW` where relevant):
+```cpp
+pb_tile (&pb_smem)[CW][2] = al.allocate<st_bf<tile_h_qo, tile_h>, CW, 2>();  // per-wg, tic/toc
+rm_vec  (&rm_smem)[CW]    = al.allocate<sv_bf<tile_h>, CW>();                 // per-wg, static
+```
+- `pb_smem[wg][tic]` — one 64×64 bf16 pair_bias tile **per consumer warpgroup
+  per tic/toc slot** (8 KB × CW × 2 stages). Each wg gets its own KV slice of
+  pair_bias; tiles are loaded in the *(q, kv)* orientation, same as they live
+  in global memory. No transposing at TMA time.
+- `rm_smem[wg]` — one 64-element res_mask vector per warpgroup, loaded
+  **once** at the top of the kernel (res_mask is independent of `qo_idx` and
+  broadcast across heads).
+
+### 4.3 New mbarriers
+
+Two additions:
+```cpp
+__shared__ kittens::semaphore pb_b[2];   // tic/toc pair_bias arrivals
+__shared__ kittens::semaphore rm_b;       // one-shot res_mask arrival
+```
+
+### 4.4 Producer-warpgroup additions
+
+In the init block and the steady-state Q-iter loop the TMA-issuing warp
+adds the per-warpgroup pair_bias prefetch (pooled on one mbarrier via a
+`CW`-sized `expect_bytes`):
+```cpp
+warp::tma::expect_bytes(pb_b[toc], sizeof(pb_tile) * CW);
+for (int w = 0; w < CW; w++) {
+    coord<pb_tile> pb_tile_idx = {batch_idx, head_idx, qo_idx + 1, (kv_block * CW) + w};
+    warp::tma::load_async(pb_smem[w][toc], g.pb, pb_tile_idx, pb_b[toc]);
+}
+```
+`batch_idx = blockIdx.z / N_SEQ` mirrors the forward's MSA broadcast: every
+`batch_msa_idx` CTA pulls from the same pair_bias[batch, head, ..] slab.
+
+`rm_smem` (per-wg) is loaded once in the semaphore-init block (outside the
+Q loop):
+```cpp
+tma::expect_bytes(rm_b, sizeof(rm_vec) * CW);
+for (int w = 0; w < CW; w++) {
+    coord<rm_vec> rm_idx = {batch_msa_idx, 0, 0, (kv_block * CW) + w};
+    tma::load_async(rm_smem[w], g.rm, rm_idx, rm_b);
+}
+```
+
+### 4.5 Consumer inner loop — new stanzas
+
+The mha_h100 bwd reconstructs P^T via a fused `stream_tile(s, L)` +
+`mma_ABt(s, k, q)` + `* scale_log2e` + `exp2` — only possible because that
+kernel's forward stores `L = -LSE/softmax_scale`. Our forward stores plain
+natural-log LSE (see §3.9), so the recompute takes an extra explicit multiply
+but gains per-call `softmax_scale` flexibility. The new steady-state stanza
+is:
+
+```cpp
+// S^T = K @ Q^T   (rt_fl<16,64>, layout: [kv_row, q_col])
+warpgroup::mm_ABt(s_block_t, k_smem[wg], q_smem[tic]);
+warpgroup::mma_async_wait();
+
+// Scale → +pair_bias → +res_mask → -LSE[q], all in natural-log space.
+warp::mul(s_block_t, s_block_t, softmax_scale);
+evo_add_pb_transposed(s_block_t, pb_smem[tic]);   // adds pair_bias[q, kv]
+warp::add_row(s_block_t, s_block_t, rm_reg_f);    // adds res_mask[kv] across rows
+evo_stream_sub_tile(s_block_t, l_smem, tic);      // subtracts L[q] along cols
+
+// Base-2 conversion and exp2 → P^T.
+warp::mul(s_block_t, s_block_t, LOG2E);
+warp::exp2(s_block_t, s_block_t);
+```
+
+The helpers — two new, one reused — are the key EvoAttention additions:
+
+- **`evo_add_pb_transposed(s_block_t, pb_smem)`** — per-thread scalar smem
+  reads. `s_block_t` has register layout (kv_row, q_col) distributed across
+  4 warps × 16 kv-rows. `pb_smem` sits in smem as (q, kv). For each of the
+  32 register elements a lane owns, the helper computes `(q_local, kv_local)`
+  and does `pb_smem[int2{q_local, kv_local}]`. The `int2` `operator[]` on
+  `st_bf` handles swizzle internally, so this is safe despite `st_bf`'s
+  internal swizzled layout. 8 bf16 scalar reads × 4 base tiles = 32 smem
+  reads per lane per q-iter — small, no cross-warp communication, no
+  register transpose, no extra smem staging.
+
+- **`evo_stream_sub_tile`** — identical in structure to `mha_h100`'s
+  `stream_sub_tile`. Broadcasts a length-`tile_h` vec across register rows
+  for the col-indexed `- LSE[q]` / `- D[q]` subtractions.
+
+- **`warp::add_row`** (existing TK primitive) — adds a `col_vec` to each
+  row of `s_block_t`. Used for res_mask since res_mask is indexed by kv =
+  the row axis of the transposed S block. `rm_reg_f` is a
+  `col_vec<rt_fl<16,64>>`, loaded once at the top of the consumer via
+  `warpgroup::load` (which distributes the 64-element sv across the 4
+  warps' 16-row slices).
+
+The rest of the loop (dP^T via `V @ dO^T`, dS via `P * (dP - D)`, then the
+standard `mma_AB(dV, P^T, dO)`, `mma_AB(dK, dS^T, Q)`, `mm_AtB(dQ, ds_smem,
+K)`, and the per-iter `store_add_async` of dQ) is inherited unchanged from
+`mha_h100`'s bwd.
+
+### 4.6 `d_pair_bias` via per-element global `atomicAdd`
+
+Triton's backward accumulates pair_bias gradients with `tl.atomic_add`
+inside its dq kernel. TK mirrors that choice: after `dS = P * (dP - D)` is
+computed and **before** the softmax_scale multiply (matching Triton), each
+lane writes its 8 owned elements of `ds_block_t` directly to global memory:
+
+```cpp
+evo_atomic_add_dpair_bias(
+    ds_block_t,
+    dpb_base_bh,                                 // &d_pair_bias[batch, head, 0, 0]
+    /*q_base*/  qo_idx * tile_h_qo,
+    /*kv_base*/ kv_block * tile_h,
+    /*N*/       N);
+```
+
+The helper uses the same register-to-coordinate math as
+`evo_add_pb_transposed`, but issues `atomicAdd(float*, float)` per element
+instead of reading.
+
+**Why atomic?** `pair_bias` is broadcast across N_SEQ. All CTAs with the
+same `batch = batch_msa_idx / N_SEQ`, same head, and overlapping
+`(q_block, kv_block)` race to the same `d_pair_bias[b, h, q, kv]` entry.
+Within one CTA there is no contention (each `(qo_idx, kv_block)` writes a
+unique (q, kv) region), but across CTAs with different `batch_msa_idx` there
+is. The hardware atomic is cheap (no barrier, no fence) and lets us avoid a
+two-pass "local accumulate then reduce" pattern.
+
+**Why not TMA `store_add_async`?** That would require the source smem tile's
+(row, col) layout to match the destination global (q, kv) layout. Our
+`ds_block_t` has (kv, q) register distribution. Lifting to (q, kv) needs
+either a manual smem-round-trip transpose or restructuring the whole
+backward around `S = Q@K^T` — neither is worth it for a workload that isn't
+atomic-bound. At N_CTX=1024, `B*N_SEQ*H*N^2 = 67 M` scalar atomics are issued
+across the GPU in parallel with the dK/dV WGMMAs; benchmark-wise it doesn't
+surface as a bottleneck (§8).
+
+### 4.7 Removed features
+
+Same trims as the forward kernel:
+- **Causal masking** — evoattention is non-causal. `causal_mask<>`, the
+  `stream_tile`-preload-of-`-LSE` trick, and the causal branch inside
+  `compute_bwd_loop` are gone.
+- **GQA / `hr > 1`** — `kv_head_idx = blockIdx.y / hr` is replaced with
+  `head_idx = blockIdx.y` everywhere.
+
+### 4.8 Consumer split and `dQ` accumulation
+
+At `CW=2`, each Q-iter looks (in outline) like mha_h100's bwd:
+
+```
+    // Both warpgroups independently:
+    compute_bwd_loop(...);                        // writes ds_smem[wg]
+    group<8>::sync(10);                           // cross-wg barrier
+
+    if (warpgroupid == 0) {
+        // Sum the two warpgroups' dS @ K contributions into qg_reg:
+        warpgroup::mm_AtB(qg_reg, ds_smem[0], k_smem[0]);
+        warpgroup::mma_AtB(qg_reg, ds_smem[1], k_smem[1]);
+        warpgroup::mma_commit_group();
+        ...                                       // store qg, store_add_async to g.qg
+        arrive(compute_done[tic]);                // producer moves on
+    }
+```
+
+Only warpgroup 0 computes `qg_reg` and writes `qg_smem`; the cross-wg sync
+before `mm_AtB` ensures wg1's `ds_smem[1]` is materialised by the time wg0
+reads it. `compute_done` is initialised with 1 arrival (wg0 alone); wg1 is
+implicitly synced via the `group<CW*WARPGROUP_WARPS>::sync` barrier, so the
+producer only waits on wg0.
+
+For final `dK`/`dV` writes both warpgroups participate, each writing its
+own kv slice (different `warpgroupid`, non-overlapping tiles, no atomic
+contention inside the CTA). `kg_smem` and `vg_smem` alias `{k_smem, v_smem}`
+and `{q_smem, og_smem}` respectively — same trick as mha_h100. With CW=2 the
+aliasing works because the allocator places them contiguously: `kg_smem[0]`
+overlaps `k_smem`'s two tiles (16 KB = 2×8 KB bf16 → 16 KB fp32), and
+`kg_smem[1]` overlaps `v_smem` (same 16 KB). By this point in the kernel
+K/V are no longer needed, so the overlap is safe.
+
+### 4.9 Shared-memory budget
+
+| D  | CW | allocations                                                                        | total    |
+|----|----|-------------------------------------------------------------------------------------|----------|
+| 64 | 2  | k,v (16+16), q[2] 16, og[2] 16, qg 16, l[2]+d[2] ~2, ds 16, pb[2][2] 32, rm[2] 0.25 | ~130 KB  |
+| 128| 1  | k,v (16+16), q[2] 32, og[2] 32, qg 32, l[2]+d[2] ~1, ds 8, pb[2] 16, rm 0.1         | ~154 KB  |
+
+Both fit under the `kittens::MAX_SHARED_MEMORY - 1024 ≈ 226 KB` driver
+budget.
+
+### 4.10 Host-side API
+
+```cpp
+evoattention_backward(q, k, v, pair_bias, res_mask, o, l_vec, og,
+                     n_seq, softmax_scale = 0.0)
+    -> {dQ, dK, dV, d_pair_bias}
+```
+All inputs bf16 CUDA contiguous except `l_vec` (fp32). Returns fp32
+gradients so the caller can accumulate or cast as needed. `d_pair_bias` has
+shape `(B, H, N, N)`; the Python layer re-inserts the MSA axis to produce
+`(B, 1, H, N, N)`. Like the forward, `softmax_scale ≤ 0` falls back to
+`1/sqrt(head_dim)`; pass the same override here that was passed to the
+forward when the caller zero-pads D.
+
+## 5. Python-side padding for non-native head dims (D ∈ {16, 32, 96})
 
 The kernel only accepts `D ∈ {64, 128}`. To support the EvoAttention head dims
 that AF3 actually uses (attention-pair-bias is 96, triangle attention is 32,
@@ -280,32 +536,36 @@ matmuls (e.g. 2× for D=32, 4× for D=16, 1.33× for D=96). The pair-bias /
 res_mask loads are unaffected. A proper D=96 specialization (with
 `st_bf<*, 96>` and 64-byte swizzle) is feasible but not yet implemented.
 
-## 5. `TKEvoAttention` (`tk_evo_attention_layer.py`)
+## 6. `TKEvoAttention` (`tk_evo_attention_layer.py`)
 
 `torch.autograd.Function` with the same calling convention as
-`MegaFold.TritonEvoformer`:
+`MegaFold.TritonEvoformer`, now with a working backward:
 
 ```python
 from tk_evo_attention_layer import TKEvoAttention
 O = TKEvoAttention.apply(Q, K, V, res_mask, pair_bias)
-# Q, K, V  : (B, N_SEQ, N_CTX, H, D)            any float dtype
+# Q, K, V  : (B, N_SEQ, N_CTX, H, D)            any float dtype (cast to bf16)
 # res_mask : (B, N_SEQ, 1, 1, N_CTX)            cast to bf16 internally
 # pair_bias: (B, 1, H, N_CTX, N_CTX)            cast to bf16 internally
 # O        : (B, N_SEQ, N_CTX, H, D)            bf16
 ```
 
-The layer encapsulates:
+`forward` encapsulates:
 1. dtype casts to bf16,
 2. `(B, N_SEQ, N_CTX, H, D) ↔ (B*N_SEQ, H, N_CTX, D)` transpose + view,
 3. pair_bias `squeeze(1)`, res_mask `view`,
-4. D padding (§4) and the matching `softmax_scale` override,
-5. slicing O back to `true_D` and transposing back to the caller layout,
-6. `ctx.save_for_backward(...)` of the padded tensors + metadata (for the
-   future backward pass).
+4. D padding (§5) and the matching `softmax_scale` override,
+5. slicing O back to `true_D` and transposing back to caller layout,
+6. `ctx.save_for_backward(...)` of the padded Q/K/V/pair_bias/res_mask/O
+   + L + metadata (`B, H, N_CTX, N_SEQ, true_D, padded_D, softmax_scale`).
 
-`backward` raises `NotImplementedError`.
+`backward` applies the same reshape/cast/pad logic to `dO`, calls
+`_C.evoattention_backward(...)`, slices the padded D columns off the fp32
+gradients, transposes back to caller layout, unsqueezes the MSA axis on
+`d_pair_bias`, casts everything back to bf16, and returns
+`(dQ, dK, dV, None, d_pair_bias)` to match the 5-arg `forward` signature.
 
-## 6. Performance tuning log
+## 7. Performance tuning log
 
 The initial correctness-first kernel (`CW=2`, `stages=2`, per-iter
 `scale → log2(e)` split, pair_bias/mask scaled in the kernel on the
@@ -324,7 +584,7 @@ initial TK (CW=2, stages=2):
 ```
 
 This section records every change we tried, in order, with the measured
-impact and whether it was kept. Final numbers are in §7.
+impact and whether it was kept. Final numbers are in §8.
 
 ### 6.1 What worked
 
@@ -514,42 +774,117 @@ fill fraction, but it would also halve the matmul size per iteration
 net positive — skipped. Would be revisited if `N_CTX=640` becomes a common
 shape in practice.
 
-## 7. Final benchmark
+## 8. Final benchmark
 
-After optimisations (a)–(d). Forward-only, `BATCH=4, H=16, D=64, N_SEQ=1`,
-bf16, H100, averaged over 2 consecutive `do_bench` runs (rep=5000ms,
-warmup=200ms):
+`BATCH=4, H=16, D=64, N_SEQ=1`, bf16, H100, `rep=3000ms, warmup=200ms` via
+`triton.testing.do_bench`. Three modes (see `benchmark.py`): forward-only,
+backward-only, and end-to-end forward+backward. Backward is with `CW=2`.
 
 ```
-  N_CTX    triton (TFLOP/s)    tk (TFLOP/s)   TK / Triton
-    128                1.78            2.36        1.33×
-    256                7.53            9.25        1.23×
-    384               17.05           18.33        1.07×
-    512               29.09           29.55        1.02×
-    640               41.83           39.25        0.94×
-    768               46.21           51.72        1.12×
-   1024               51.60           71.19        1.38×
+=== Forward only ===
+  N_CTX    triton (TFLOP/s)    tk (TFLOP/s)     ratio
+    128                1.75            2.30     1.31x
+    256                7.08            8.75     1.24x
+    384               16.25           17.25     1.06x
+    512               26.91           28.51     1.06x
+    640               42.34           38.32     0.91x
+    768               46.14           50.74     1.10x
+   1024               51.64           70.63     1.37x
+
+=== Backward only ===
+  N_CTX    triton (TFLOP/s)    tk (TFLOP/s)     ratio
+    128                1.91            2.29     1.20x
+    256                7.46            8.19     1.10x
+    384               16.93           15.92     0.94x
+    512               29.03           25.62     0.88x
+    640               31.37           33.11     1.06x
+    768               33.05           41.76     1.26x
+   1024               34.69           53.87     1.55x
+
+=== Full (fwd + bwd) ===
+  N_CTX    triton (TFLOP/s)    tk (TFLOP/s)     ratio
+    128                1.59            1.86     1.17x
+    256                6.36            7.02     1.10x
+    384               14.22           14.24     1.00x
+    512               25.41           22.77     0.90x
+    640               33.87           30.59     0.90x
+    768               36.00           38.69     1.07x
+   1024               38.39           52.75     1.37x
 ```
 
-TK is faster than Triton at every benchmark shape except `N_CTX=640` where
-it is ~6% slower. The large wins at 128/256/1024 are mainly from the
-3-stage pipeline plus the register-pressure discipline described above.
-The N_CTX=640 gap is the pipeline-fill-fraction issue noted in (h).
+Forward matches §7's prior numbers. Backward is ahead at 128/256/640/768/1024
+(up to 1.55× at 1024); slightly behind at 384 and 512. The CW=2→1 tail story:
 
-## 8. Constraints
+- **N_CTX=384**, CW=2 → `ceil(384/128)=3` kv-blocks per (head, batch).
+  `3 × 16 heads × 4 batch = 192` CTAs / 132 SMs = **1.45 waves** — small-tail
+  shape where the 2-wave work is only ~13% utilised. CW=1 was better here
+  (2.91 waves before), but CW=2 wins every other bwd shape.
+- **N_CTX=512**, CW=2 → `4 × 16 × 4 = 256` CTAs / 132 = **1.94 waves**.
+  Similar tail story; CW=2 is 0.88×.
+- **N_CTX ≥ 640**: enough CTAs that the tail fraction is small; CW=2's
+  doubled per-CTA work and halved producer/TMA overhead dominate.
+
+Forward-kernel N_CTX=640 is still the pipeline-fill-fraction issue from §7
+(separate from the bwd CW discussion).
+
+### 8.1 FLOP counting
+
+Per `(B, N_SEQ, H, N, D)`:
+- fwd  : `4 * N^2 * D`  — two matmuls (`Q@K^T`, `P@V`).
+- bwd  : `10 * N^2 * D` — five matmuls (`S^T = KQ^T`, `dP^T = V dO^T`, `dV = P^T dO`, `dK = dS^T Q`, `dQ = dS K`).
+- full : `14 * N^2 * D` — sum of the two.
+Pair-bias/mask adds, softmax, and any recomputation are ignored, matching
+`evoattention_speed.py`.
+
+### 8.2 Benchmark methodology note (why "bwd fast + fwd fast ≠ full fast")
+
+An earlier version of this benchmark had a subtle asymmetry between the
+`bwd` and `full` modes that produced a confusing result: at some shapes TK
+was ahead on both fwd and bwd individually but behind on full.
+
+The cause was **gradient accumulation into `.grad`**. In the `bwd` bench
+we call `o.backward(do, retain_graph=True)` repeatedly on a single
+pre-built autograd graph. PyTorch's default behavior is to **add** the new
+gradient into `param.grad` if it's already populated. After the first
+iteration, every subsequent call paid the bandwidth of
+`param.grad += new_grad` for all grad leaves — Q, K, V, and especially
+pair_bias (`.grad` shape `(B, 1, H, N, N)` = 268 MB at N_CTX=1024). That's a
+real memory-traffic cost, but it's **not** in the backward kernel itself.
+
+The `full` mode, by contrast, zeroed `.grad = None` before every iteration
+(so that each fwd+bwd is independent), which means PyTorch *assigned* new
+grads rather than accumulating — no grad-memory read, no extra bandwidth.
+
+Fix: the current `_bench_bwd` now also zeroes `.grad = None` before each
+iteration, so `bwd` and `full` measure the same notion of backward work.
+After the fix, `full ≈ fwd + bwd` up to a small launch/autograd-overhead
+constant, which is the correct expectation.
+
+There is also a small residual TK-wrapper overhead in `full` (but not in
+isolated `bwd` or `fwd`): each backward call does `fp32 kernel output →
+bf16 cast → transpose+contiguous` for each of dQ, dK, dV. Casting fp32→bf16
+**before** the transpose (halving the bytes moved by the transpose) was
+applied in `TKEvoAttention.backward` as part of this investigation; it
+trimmed ~30 μs per full-step call at N_CTX=384 D=64, enough to bring
+`full` from "slower than Triton" to "tied" at that shape.
+
+## 9. Constraints
 
 - `D ∈ {16, 32, 64, 96, 128}` (via padding; kernel natively `{64, 128}`).
-- `N_CTX` divisible by 128 (kv_height).
-- For native D=64: `N_CTX` divisible by `2 * qo_height = 128`.
-- For native D=128: `N_CTX` divisible by `1 * qo_height = 64`; combined with
-  the kv_height rule this still requires `N_CTX % 128 == 0`.
+- Forward: `N_CTX` divisible by `kv_height = 128`. Bwd: at D=64 (CW=2),
+  `N_CTX` divisible by `CW*tile_h = 128`; at D=128 (CW=1), divisible by 64.
+  The forward's 128 constraint is always the stricter one.
+- For native D=64 forward: `N_CTX` divisible by `CW_fwd * qo_height = 128`.
+- For native D=128 forward: `N_CTX` divisible by `1 * qo_height = 64`;
+  combined with the kv_height rule this still requires `N_CTX % 128 == 0`.
 - GPU: H100 (SM 90). Set `GPU := H100` in the Makefile.
 
-## 9. Build & run
+## 10. Build & run
 
 ```
 cd kernels/attention/evo_h100
-make                                # builds _C.cpython-*.so
-python3 test_tk_evoattention.py     # correctness vs. Triton reference
-python3 benchmark.py                # speed vs. Triton
+make                                    # builds _C.cpython-*.so (fwd + bwd)
+python3 test_tk_evoattention.py         # forward correctness vs. Triton
+python3 test_tk_evoattention_bwd.py     # backward correctness vs. Triton
+python3 benchmark.py                    # fwd + bwd + full TFLOP/s vs. Triton
 ```
