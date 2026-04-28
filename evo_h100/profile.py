@@ -34,7 +34,7 @@ from evoattention import TritonEvoformer
 
 
 # --- Config (matches benchmark.py) ------------------------------------------
-BATCH    = 4
+BATCH    = 1
 N_HEADS  = 16
 HEAD_DIM = 64
 N_SEQ    = 1

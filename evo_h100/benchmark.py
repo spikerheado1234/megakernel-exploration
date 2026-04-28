@@ -26,12 +26,12 @@ sys.path.insert(0, HERE)
 MEGAFOLD = os.path.expanduser("~/MegaFold/megafold/model/FusedEvoAttention")
 sys.path.insert(0, MEGAFOLD)
 
-from tk_evo_attention_layer import TKEvoAttention
+from tk_evo_attention_layer import TKEvoAttention, tk_evo_forward_cw3, _HAVE_CW3
 from evoattention import TritonEvoformer
 
 
 # ---- Config (matches evoattention_speed.py defaults) ------------------------
-BATCH       = 4
+BATCH       = 1
 N_HEADS     = 16
 HEAD_DIM    = 64
 N_SEQ       = 1
@@ -153,5 +153,63 @@ def main():
         _print_table(title, rows)
 
 
+# ----------------------------------------------------------------------------
+# Experiment: CW=2 (production) vs CW=3 (with pad-to-384 zero-padding)
+# Forward only — answers the question "is pad-then-CW=3 worth it for this
+# shape distribution?" The pad cost is paid by the Python wrapper inside the
+# timed region, just like the production wrapper's own ops.
+# ----------------------------------------------------------------------------
+
+def _bench_fwd_cw3(pair_bias_dtype, N_CTX):
+    q, k, v, res_mask, pair_bias = make_inputs(N_CTX, pair_bias_dtype, requires_grad=False)
+    fn = lambda: tk_evo_forward_cw3(q, k, v, res_mask, pair_bias)
+    fn()
+    torch.cuda.synchronize()
+    return triton.testing.do_bench(fn, rep=REP_MS, warmup=WARMUP_MS)
+
+
+def _print_experiment_table(rows):
+    title = "Experiment: CW=2 vs CW=3 (forward only, TFLOP/s)"
+    print(f"=== {title} ===")
+    header = (f"{'N_CTX':>7}  {'pad->':>6}  "
+              f"{'cw2 (TFLOP/s)':>14}  {'cw3 (TFLOP/s)':>14}  {'cw3/cw2':>8}")
+    print(header)
+    print("-" * len(header))
+    for (n, padded_n, cw2_tf, cw3_tf) in rows:
+        ratio = cw3_tf / cw2_tf if cw2_tf > 0 else float("nan")
+        print(f"{n:>7}  {padded_n:>6}  {cw2_tf:>14.2f}  {cw3_tf:>14.2f}  {ratio:>7.2f}x")
+    print()
+
+
+def experiment_cw2_vs_cw3():
+    if not _HAVE_CW3:
+        print("CW=3 module not built. Run `make -f Makefile.cw3` first.")
+        return
+
+    print(f"BATCH={BATCH}  H={N_HEADS}  D={HEAD_DIM}  N_SEQ={N_SEQ}  "
+          f"dtype={DTYPE}  device={DEVICE}")
+    print(f"FLOPs counted on the *true* (unpadded) N_CTX — pad-side work is "
+          f"included in wall time but not in the throughput numerator.")
+    print()
+
+    rows = []
+    for n in N_CTX_VALS:
+        flops = _flops(FWD_MULT, BATCH, N_SEQ, N_HEADS, n, HEAD_DIM)
+
+        cw2_ms = _bench_fwd(TKEvoAttention.apply, pair_bias_dtype=torch.bfloat16, N_CTX=n)
+        cw3_ms = _bench_fwd_cw3(pair_bias_dtype=torch.bfloat16, N_CTX=n)
+
+        padded_n = ((n + 383) // 384) * 384
+        rows.append((n, padded_n,
+                     flops * 1e-12 / (cw2_ms * 1e-3),
+                     flops * 1e-12 / (cw3_ms * 1e-3)))
+
+    _print_experiment_table(rows)
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "experiment":
+        experiment_cw2_vs_cw3()
+    else:
+        main()

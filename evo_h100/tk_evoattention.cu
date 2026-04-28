@@ -24,17 +24,24 @@ namespace cg = cooperative_groups;
 // log2(e)
 __device__ constexpr float LOG2E = 1.44269504089f;
 
-// Per-D tile/pipeline config. CW is per-D so we can fit D=128
-// within the shared memory budget.
-template<int D> struct evo_fwd_tile_dims {};
-template<> struct evo_fwd_tile_dims<64> {
+// Per-(D, N) tile/pipeline config. CW is selected at compile time:
+// at D=64, prefer CW=3 (with stages=2) when N is divisible by 3*qo_height=192,
+// since 3 consumer warpgroups land more work per CTA and amortize the pipeline
+// faster on natively aligned shapes. Fall back to CW=2 (with stages=3) otherwise.
+// At D=128 the smem budget pins CW=1 regardless of N.
+//
+// Template param is named N_KIND, not N, to avoid shadowing the `N` runtime
+// field in evo_fwd_globals (the kernel uses g.N at runtime for actual SEQ_LEN).
+template<int D, int N_KIND> struct evo_fwd_tile_dims {};
+template<int N_KIND> struct evo_fwd_tile_dims<64, N_KIND> {
     constexpr static int tile_width          = 64;
     constexpr static int qo_height           = 64;
     constexpr static int kv_height           = 128;
-    constexpr static int stages              = 3;  // 3-stage pipeline fits in smem for D=64
-    constexpr static int consumer_warpgroups = 2;
+    constexpr static int consumer_warpgroups = (N_KIND % 192 == 0) ? 3 : 2;
+    constexpr static int stages              = (N_KIND % 192 == 0) ? 2 : 3;
 };
-template<> struct evo_fwd_tile_dims<128> {
+// This will be unused, EvoAttention has small head-dim.
+template<int N_KIND> struct evo_fwd_tile_dims<128, N_KIND> {
     constexpr static int tile_width          = 128;
     constexpr static int qo_height           = 64;
     constexpr static int kv_height           = 128;
@@ -42,19 +49,19 @@ template<> struct evo_fwd_tile_dims<128> {
     constexpr static int consumer_warpgroups = 1;
 };
 
-template<int D>
+template<int D, int N_KIND>
 constexpr int evo_num_workers() {
-    return (evo_fwd_tile_dims<D>::consumer_warpgroups + 1) * kittens::WARPGROUP_WARPS;
+    return (evo_fwd_tile_dims<D, N_KIND>::consumer_warpgroups + 1) * kittens::WARPGROUP_WARPS;
 }
 
-template<int D> struct evo_fwd_globals {
-    using q_tile    =         st_bf<evo_fwd_tile_dims<D>::qo_height, evo_fwd_tile_dims<D>::tile_width>;
-    using k_tile    =         st_bf<evo_fwd_tile_dims<D>::kv_height, evo_fwd_tile_dims<D>::tile_width>;
-    using v_tile    =         st_bf<evo_fwd_tile_dims<D>::kv_height, evo_fwd_tile_dims<D>::tile_width>;
-    using o_tile    =         st_bf<evo_fwd_tile_dims<D>::qo_height, evo_fwd_tile_dims<D>::tile_width>;
-    using l_col_vec = col_vec<st_fl<evo_fwd_tile_dims<D>::qo_height, evo_fwd_tile_dims<D>::tile_width>>;
-    using pb_tile   =         st_bf<evo_fwd_tile_dims<D>::qo_height, evo_fwd_tile_dims<D>::kv_height>;
-    using rm_vec    =         sv_bf<evo_fwd_tile_dims<D>::kv_height>;
+template<int D, int N_KIND> struct evo_fwd_globals {
+    using q_tile    =         st_bf<evo_fwd_tile_dims<D, N_KIND>::qo_height, evo_fwd_tile_dims<D, N_KIND>::tile_width>;
+    using k_tile    =         st_bf<evo_fwd_tile_dims<D, N_KIND>::kv_height, evo_fwd_tile_dims<D, N_KIND>::tile_width>;
+    using v_tile    =         st_bf<evo_fwd_tile_dims<D, N_KIND>::kv_height, evo_fwd_tile_dims<D, N_KIND>::tile_width>;
+    using o_tile    =         st_bf<evo_fwd_tile_dims<D, N_KIND>::qo_height, evo_fwd_tile_dims<D, N_KIND>::tile_width>;
+    using l_col_vec = col_vec<st_fl<evo_fwd_tile_dims<D, N_KIND>::qo_height, evo_fwd_tile_dims<D, N_KIND>::tile_width>>;
+    using pb_tile   =         st_bf<evo_fwd_tile_dims<D, N_KIND>::qo_height, evo_fwd_tile_dims<D, N_KIND>::kv_height>;
+    using rm_vec    =         sv_bf<evo_fwd_tile_dims<D, N_KIND>::kv_height>;
 
     using q_gl  = gl<bf16,  -1, -1, -1, -1, q_tile>;
     using k_gl  = gl<bf16,  -1, -1, -1, -1, k_tile>;
@@ -77,16 +84,16 @@ template<int D> struct evo_fwd_globals {
     const float scale; // 1/sqrt(D)
 };
 
-template<int D>
-__global__ __launch_bounds__(evo_num_workers<D>() * kittens::WARP_THREADS, 1)
-void evo_fwd_ker(const __grid_constant__ evo_fwd_globals<D> g) {
+template<int D, int N_KIND>
+__global__ __launch_bounds__(evo_num_workers<D, N_KIND>() * kittens::WARP_THREADS, 1)
+void evo_fwd_ker(const __grid_constant__ evo_fwd_globals<D, N_KIND> g) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
 
     int warpid = kittens::warpid();
     int warpgroupid = warpid / kittens::WARPGROUP_WARPS;
 
-    using K = evo_fwd_tile_dims<D>;
+    using K = evo_fwd_tile_dims<D, N_KIND>;
     constexpr int CW              = K::consumer_warpgroups;
     constexpr int NUM_WARPGROUPS  = CW + 1;                       // +1 producer
     constexpr int NUM_WORKERS     = NUM_WARPGROUPS * kittens::WARPGROUP_WARPS;
@@ -942,16 +949,17 @@ evoattention_forward(at::Tensor q,
         ? static_cast<float>(softmax_scale_override)
         : 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-    auto launch = [&](auto D_tag) {
-        constexpr int D   = decltype(D_tag)::value;
-        constexpr int D_CW = evo_fwd_tile_dims<D>::consumer_warpgroups;
-        constexpr int D_NUM_WORKERS = evo_num_workers<D>();
+    auto launch = [&](auto D_tag, auto N_tag) {
+        constexpr int D      = decltype(D_tag)::value;
+        constexpr int N_KIND = decltype(N_tag)::value;
+        constexpr int D_CW = evo_fwd_tile_dims<D, N_KIND>::consumer_warpgroups;
+        constexpr int D_NUM_WORKERS = evo_num_workers<D, N_KIND>();
 
         TORCH_CHECK(seq_len % (D_CW * QO_H) == 0,
                     "SEQ_LEN must be divisible by consumer_warpgroups*qo_height = ",
                     D_CW * QO_H, " for head_dim=", D);
 
-        using globals = evo_fwd_globals<D>;
+        using globals = evo_fwd_globals<D, N_KIND>;
         using q_global  = typename globals::q_gl;
         using k_global  = typename globals::k_gl;
         using v_global  = typename globals::v_gl;
@@ -977,17 +985,25 @@ evoattention_forward(at::Tensor q,
                   static_cast<unsigned>(heads),
                   static_cast<unsigned>(batch_msa));
 
-        cudaFuncSetAttribute(evo_fwd_ker<D>,
+        cudaFuncSetAttribute(evo_fwd_ker<D, N_KIND>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              mem_size);
-        evo_fwd_ker<D><<<grid, 32 * D_NUM_WORKERS, mem_size, stream>>>(g);
+        evo_fwd_ker<D, N_KIND><<<grid, 32 * D_NUM_WORKERS, mem_size, stream>>>(g);
         CHECK_CUDA_ERROR(cudaGetLastError());
     };
 
+    // The N tag here is a divisibility witness, not the actual sequence length:
+    // tile_dims keys off (N % 192 == 0) to pick CW=3 vs CW=2 at D=64. So we pass
+    // 384 (divisible by 192) for the CW=3 path and 256 (not divisible) for CW=2.
+    // The kernel still uses g.N (runtime) for the real sequence length.
     if (head_dim == 64) {
-        launch(std::integral_constant<int, 64>{});
+        if (seq_len % 192 == 0) {
+            launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 384>{});
+        } else {
+            launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 256>{});
+        }
     } else {
-        launch(std::integral_constant<int, 128>{});
+        launch(std::integral_constant<int, 128>{}, std::integral_constant<int, 256>{});
     }
 
     cudaStreamSynchronize(stream);

@@ -23,6 +23,15 @@ if HERE not in sys.path:
 
 import _C  # built tk_evoattention extension
 
+# Optional: experimental CW=3 forward variant. Built separately via
+# Makefile.cw3, so it may not be present in every checkout.
+try:
+    import _C_cw3
+    _HAVE_CW3 = True
+except ImportError:
+    _C_cw3 = None
+    _HAVE_CW3 = False
+
 
 # Head-dim values the CUDA kernel supports natively. Anything else is
 # zero-padded up to the next supported value on the way in; output is sliced
@@ -161,3 +170,73 @@ class TKEvoAttention(torch.autograd.Function):
         # forward signature: forward(ctx, Q, K, V, res_mask, pair_bias) -> O
         # so backward returns one grad per input (+ None for non-diff tensors).
         return dQ, dK, dV, None, d_pair_bias
+
+
+# -----------------------------------------------------------------------------
+# Experimental CW=3 forward variant. Pads SEQ_LEN up to a multiple of 384
+# (lcm of CW*qo_height=192 and kv_height=128), then slices back.
+#
+# Forward only — used by benchmark.py / test_tk_evoattention_cw3.py to compare
+# against the production CW=2 forward.
+# -----------------------------------------------------------------------------
+
+CW3_PAD_MULTIPLE = 384
+
+
+def tk_evo_forward_cw3(Q, K, V, res_mask, pair_bias):
+    """Forward-only CW=3 EvoAttention. Same input layout as TKEvoAttention."""
+    if not _HAVE_CW3:
+        raise RuntimeError(
+            "CW=3 module not built. Run `make -f Makefile.cw3` in this directory."
+        )
+
+    B, N_SEQ, N_CTX, H, D = Q.shape
+    assert D == 64, "CW=3 variant only supports head_dim=64"
+    assert K.shape == (B, N_SEQ, N_CTX, H, D)
+    assert V.shape == (B, N_SEQ, N_CTX, H, D)
+    assert res_mask.shape == (B, N_SEQ, 1, 1, N_CTX)
+    assert pair_bias.shape == (B, 1, H, N_CTX, N_CTX)
+
+    bf16 = torch.bfloat16
+
+    def to_tk_qkv(x):
+        x = x.to(bf16) if x.dtype != bf16 else x
+        return x.transpose(-2, -3).contiguous().view(B * N_SEQ, H, N_CTX, D)
+
+    Q_tk = to_tk_qkv(Q)
+    K_tk = to_tk_qkv(K)
+    V_tk = to_tk_qkv(V)
+    pair_bias_tk = pair_bias.squeeze(1).contiguous().to(bf16)
+    res_mask_tk  = res_mask.reshape(B * N_SEQ, 1, 1, N_CTX).contiguous().to(bf16)
+
+    # Pad SEQ to multiple of 384 along N axis. Q/K/V padded with zeros.
+    # pair_bias padded with zeros (the actual masking happens through res_mask).
+    # res_mask padded with -inf so softmax kills the padded KV positions.
+    n_pad_total = (CW3_PAD_MULTIPLE - (N_CTX % CW3_PAD_MULTIPLE)) % CW3_PAD_MULTIPLE
+    if n_pad_total != 0:
+        N_PAD = N_CTX + n_pad_total
+        Q_tk = F.pad(Q_tk, (0, 0, 0, n_pad_total), value=0.0).contiguous()
+        K_tk = F.pad(K_tk, (0, 0, 0, n_pad_total), value=0.0).contiguous()
+        V_tk = F.pad(V_tk, (0, 0, 0, n_pad_total), value=0.0).contiguous()
+        # pair_bias: pad both last two dims (the kernel reads N_PAD x N_PAD).
+        pair_bias_tk = F.pad(
+            pair_bias_tk, (0, n_pad_total, 0, n_pad_total), value=0.0
+        ).contiguous()
+        # res_mask: pad final dim with a large negative so softmax kills
+        # padded KV positions. Using -1e9 (matches the magnitude the existing
+        # tests use for masked-out positions) — safely representable in bf16.
+        res_mask_tk = F.pad(
+            res_mask_tk, (0, n_pad_total), value=-1e9
+        ).contiguous()
+    else:
+        N_PAD = N_CTX
+
+    softmax_scale = 1.0 / (D ** 0.5)
+
+    O_pad, _L = _C_cw3.evoattention_forward_cw3(
+        Q_tk, K_tk, V_tk, pair_bias_tk, res_mask_tk, N_SEQ, softmax_scale
+    )
+    # O_pad: (B*N_SEQ, H, N_PAD, D) bf16. Slice off the padded sequence rows.
+    O = O_pad[:, :, :N_CTX, :].contiguous()
+    O = O.view(B, N_SEQ, H, N_CTX, D).transpose(-2, -3).contiguous()
+    return O
