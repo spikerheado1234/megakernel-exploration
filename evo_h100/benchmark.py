@@ -26,7 +26,11 @@ sys.path.insert(0, HERE)
 MEGAFOLD = os.path.expanduser("~/MegaFold/megafold/model/FusedEvoAttention")
 sys.path.insert(0, MEGAFOLD)
 
-from tk_evo_attention_layer import TKEvoAttention, tk_evo_forward_cw3, _HAVE_CW3
+from tk_evo_attention_layer import (
+    TKEvoAttention,
+    tk_evo_forward_cw3, _HAVE_CW3,
+    tk_evo_forward_cw4, _HAVE_CW4,
+)
 from evoattention import TritonEvoformer
 
 
@@ -207,9 +211,111 @@ def experiment_cw2_vs_cw3():
     _print_experiment_table(rows)
 
 
+# ----------------------------------------------------------------------------
+# Experiment: CW=2 (production) vs CW=2 ping-pong (FA3-style schedule).
+# Forward only — restricted to the N_CTX values served by the production
+# CW=2 path (excludes 384 and 768, which use CW=3).
+# ----------------------------------------------------------------------------
+
+CW4_N_CTX_VALS = [128, 256, 512, 640, 1024]
+
+
+def _bench_fwd_cw4(pair_bias_dtype, N_CTX):
+    q, k, v, res_mask, pair_bias = make_inputs(N_CTX, pair_bias_dtype, requires_grad=False)
+    fn = lambda: tk_evo_forward_cw4(q, k, v, res_mask, pair_bias)
+    fn()
+    torch.cuda.synchronize()
+    return triton.testing.do_bench(fn, rep=REP_MS, warmup=WARMUP_MS)
+
+
+def _print_pp_experiment_table(rows):
+    title = "Experiment: CW=2 production vs CW=2 ping-pong (forward only, TFLOP/s)"
+    print(f"=== {title} ===")
+    header = (f"{'N_CTX':>7}  "
+              f"{'cw2 (TFLOP/s)':>14}  {'pp  (TFLOP/s)':>14}  {'pp/cw2':>8}")
+    print(header)
+    print("-" * len(header))
+    for (n, cw2_tf, pp_tf) in rows:
+        ratio = pp_tf / cw2_tf if cw2_tf > 0 else float("nan")
+        print(f"{n:>7}  {cw2_tf:>14.2f}  {pp_tf:>14.2f}  {ratio:>7.2f}x")
+    print()
+
+
+def experiment_cw2_vs_pingpong():
+    if not _HAVE_CW4:
+        print("CW=2 ping-pong module not built. Run `make -f Makefile.cw4` first.")
+        return
+
+    print(f"BATCH={BATCH}  H={N_HEADS}  D={HEAD_DIM}  N_SEQ={N_SEQ}  "
+          f"dtype={DTYPE}  device={DEVICE}")
+    print(f"Excluding N=384 and N=768 (those use CW=3 in production).")
+    print()
+
+    rows = []
+    for n in CW4_N_CTX_VALS:
+        flops = _flops(FWD_MULT, BATCH, N_SEQ, N_HEADS, n, HEAD_DIM)
+        cw2_ms = _bench_fwd(TKEvoAttention.apply, pair_bias_dtype=torch.bfloat16, N_CTX=n)
+        pp_ms  = _bench_fwd_cw4(pair_bias_dtype=torch.bfloat16, N_CTX=n)
+        rows.append((n,
+                     flops * 1e-12 / (cw2_ms * 1e-3),
+                     flops * 1e-12 / (pp_ms * 1e-3)))
+
+    _print_pp_experiment_table(rows)
+
+
+# ----------------------------------------------------------------------------
+# Experiment: production CW=3 vs CW=2 ping-pong at the sizes where production
+# normally picks CW=3 (N divisible by 192 → N=384, N=768). Forward only.
+# ----------------------------------------------------------------------------
+
+CW3_VS_PP_N_CTX_VALS = [384, 768]
+
+
+def _print_cw3_vs_pp_table(rows):
+    title = "Experiment: production CW=3 vs CW=2 ping-pong at CW=3 sizes (forward only, TFLOP/s)"
+    print(f"=== {title} ===")
+    header = (f"{'N_CTX':>7}  "
+              f"{'cw3 (TFLOP/s)':>14}  {'pp  (TFLOP/s)':>14}  {'pp/cw3':>8}")
+    print(header)
+    print("-" * len(header))
+    for (n, cw3_tf, pp_tf) in rows:
+        ratio = pp_tf / cw3_tf if cw3_tf > 0 else float("nan")
+        print(f"{n:>7}  {cw3_tf:>14.2f}  {pp_tf:>14.2f}  {ratio:>7.2f}x")
+    print()
+
+
+def experiment_cw3_vs_pingpong():
+    if not _HAVE_CW4:
+        print("CW=2 ping-pong module not built. Run `make -f Makefile.cw4` first.")
+        return
+
+    print(f"BATCH={BATCH}  H={N_HEADS}  D={HEAD_DIM}  N_SEQ={N_SEQ}  "
+          f"dtype={DTYPE}  device={DEVICE}")
+    print(f"Sizes shown are those where the production kernel uses CW=3 "
+          f"(N divisible by 192). Production CW=3 is reached through "
+          f"TKEvoAttention.apply; ping-pong is the CW=2 variant.")
+    print()
+
+    rows = []
+    for n in CW3_VS_PP_N_CTX_VALS:
+        flops = _flops(FWD_MULT, BATCH, N_SEQ, N_HEADS, n, HEAD_DIM)
+        # Production routes N=384 and N=768 through evo_fwd_ker<64, 384> (CW=3).
+        cw3_ms = _bench_fwd(TKEvoAttention.apply, pair_bias_dtype=torch.bfloat16, N_CTX=n)
+        pp_ms  = _bench_fwd_cw4(pair_bias_dtype=torch.bfloat16, N_CTX=n)
+        rows.append((n,
+                     flops * 1e-12 / (cw3_ms * 1e-3),
+                     flops * 1e-12 / (pp_ms * 1e-3)))
+
+    _print_cw3_vs_pp_table(rows)
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "experiment":
         experiment_cw2_vs_cw3()
+    elif len(sys.argv) > 1 and sys.argv[1] == "pingpong":
+        experiment_cw2_vs_pingpong()
+    elif len(sys.argv) > 1 and sys.argv[1] == "cw3vspp":
+        experiment_cw3_vs_pingpong()
     else:
         main()

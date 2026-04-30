@@ -24,24 +24,39 @@ namespace cg = cooperative_groups;
 // log2(e)
 __device__ constexpr float LOG2E = 1.44269504089f;
 
-// Per-(D, N) tile/pipeline config. CW is selected at compile time:
-// at D=64, prefer CW=3 (with stages=2) when N is divisible by 3*qo_height=192,
-// since 3 consumer warpgroups land more work per CTA and amortize the pipeline
-// faster on natively aligned shapes. Fall back to CW=2 (with stages=3) otherwise.
-// At D=128 the smem budget pins CW=1 regardless of N.
-//
-// Template param is named N_KIND, not N, to avoid shadowing the `N` runtime
-// field in evo_fwd_globals (the kernel uses g.N at runtime for actual SEQ_LEN).
-template<int D, int N_KIND> struct evo_fwd_tile_dims {};
-template<int N_KIND> struct evo_fwd_tile_dims<64, N_KIND> {
+// Named-barrier IDs for the FA3-style ping-pong schedule between the two
+// D=64 consumer warpgroups. WG0 and WG1 alternate exclusive access to the
+// tensor cores (MMA_TOKEN) and the CUDA-core / SFU softmax pipeline
+// (CORR_TOKEN), so the QK MMA of one WG runs in parallel with the softmax
+// of the other WG. IDs 4/5 are reserved by the per-WG epilogue
+// `warpgroup::sync(warpgroupid + 4)`; pick 6/7 to avoid clashes.
+constexpr int FWD_MMA_TOKEN  = 6;
+constexpr int FWD_CORR_TOKEN = 7;
+
+template<int ID, int COUNT>
+__device__ __forceinline__ void fwd_named_bar_sync() {
+    asm volatile("bar.sync %0, %1;" :: "n"(ID), "n"(COUNT) : "memory");
+}
+template<int ID, int COUNT>
+__device__ __forceinline__ void fwd_named_bar_arrive() {
+    asm volatile("bar.arrive %0, %1;" :: "n"(ID), "n"(COUNT) : "memory");
+}
+
+// Per-D forward tile/pipeline config.
+// At D=64 we run two consumer warpgroups with FA3-style ping-pong scheduling
+// (CW=3 was tried but is dominated by ping-pong CW=2 across all N; see
+// `experiment_cw3_vs_pingpong()` in benchmark.py). At D=128 the smem budget
+// pins CW=1 — only one consumer WG, so ping-pong does not apply.
+template<int D> struct evo_fwd_tile_dims {};
+template<> struct evo_fwd_tile_dims<64> {
     constexpr static int tile_width          = 64;
     constexpr static int qo_height           = 64;
     constexpr static int kv_height           = 128;
-    constexpr static int consumer_warpgroups = (N_KIND % 192 == 0) ? 3 : 2;
-    constexpr static int stages              = (N_KIND % 192 == 0) ? 2 : 3;
+    constexpr static int consumer_warpgroups = 2;
+    constexpr static int stages              = 3;
 };
-// This will be unused, EvoAttention has small head-dim.
-template<int N_KIND> struct evo_fwd_tile_dims<128, N_KIND> {
+// EvoAttention has small head-dim; D=128 is rarely hit but kept for safety.
+template<> struct evo_fwd_tile_dims<128> {
     constexpr static int tile_width          = 128;
     constexpr static int qo_height           = 64;
     constexpr static int kv_height           = 128;
@@ -49,19 +64,19 @@ template<int N_KIND> struct evo_fwd_tile_dims<128, N_KIND> {
     constexpr static int consumer_warpgroups = 1;
 };
 
-template<int D, int N_KIND>
+template<int D>
 constexpr int evo_num_workers() {
-    return (evo_fwd_tile_dims<D, N_KIND>::consumer_warpgroups + 1) * kittens::WARPGROUP_WARPS;
+    return (evo_fwd_tile_dims<D>::consumer_warpgroups + 1) * kittens::WARPGROUP_WARPS;
 }
 
-template<int D, int N_KIND> struct evo_fwd_globals {
-    using q_tile    =         st_bf<evo_fwd_tile_dims<D, N_KIND>::qo_height, evo_fwd_tile_dims<D, N_KIND>::tile_width>;
-    using k_tile    =         st_bf<evo_fwd_tile_dims<D, N_KIND>::kv_height, evo_fwd_tile_dims<D, N_KIND>::tile_width>;
-    using v_tile    =         st_bf<evo_fwd_tile_dims<D, N_KIND>::kv_height, evo_fwd_tile_dims<D, N_KIND>::tile_width>;
-    using o_tile    =         st_bf<evo_fwd_tile_dims<D, N_KIND>::qo_height, evo_fwd_tile_dims<D, N_KIND>::tile_width>;
-    using l_col_vec = col_vec<st_fl<evo_fwd_tile_dims<D, N_KIND>::qo_height, evo_fwd_tile_dims<D, N_KIND>::tile_width>>;
-    using pb_tile   =         st_bf<evo_fwd_tile_dims<D, N_KIND>::qo_height, evo_fwd_tile_dims<D, N_KIND>::kv_height>;
-    using rm_vec    =         sv_bf<evo_fwd_tile_dims<D, N_KIND>::kv_height>;
+template<int D> struct evo_fwd_globals {
+    using q_tile    =         st_bf<evo_fwd_tile_dims<D>::qo_height, evo_fwd_tile_dims<D>::tile_width>;
+    using k_tile    =         st_bf<evo_fwd_tile_dims<D>::kv_height, evo_fwd_tile_dims<D>::tile_width>;
+    using v_tile    =         st_bf<evo_fwd_tile_dims<D>::kv_height, evo_fwd_tile_dims<D>::tile_width>;
+    using o_tile    =         st_bf<evo_fwd_tile_dims<D>::qo_height, evo_fwd_tile_dims<D>::tile_width>;
+    using l_col_vec = col_vec<st_fl<evo_fwd_tile_dims<D>::qo_height, evo_fwd_tile_dims<D>::tile_width>>;
+    using pb_tile   =         st_bf<evo_fwd_tile_dims<D>::qo_height, evo_fwd_tile_dims<D>::kv_height>;
+    using rm_vec    =         sv_bf<evo_fwd_tile_dims<D>::kv_height>;
 
     using q_gl  = gl<bf16,  -1, -1, -1, -1, q_tile>;
     using k_gl  = gl<bf16,  -1, -1, -1, -1, k_tile>;
@@ -84,19 +99,22 @@ template<int D, int N_KIND> struct evo_fwd_globals {
     const float scale; // 1/sqrt(D)
 };
 
-template<int D, int N_KIND>
-__global__ __launch_bounds__(evo_num_workers<D, N_KIND>() * kittens::WARP_THREADS, 1)
-void evo_fwd_ker(const __grid_constant__ evo_fwd_globals<D, N_KIND> g) {
+template<int D>
+__global__ __launch_bounds__(evo_num_workers<D>() * kittens::WARP_THREADS, 1)
+void evo_fwd_ker(const __grid_constant__ evo_fwd_globals<D> g) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
 
     int warpid = kittens::warpid();
     int warpgroupid = warpid / kittens::WARPGROUP_WARPS;
 
-    using K = evo_fwd_tile_dims<D, N_KIND>;
+    using K = evo_fwd_tile_dims<D>;
     constexpr int CW              = K::consumer_warpgroups;
     constexpr int NUM_WARPGROUPS  = CW + 1;                       // +1 producer
     constexpr int NUM_WORKERS     = NUM_WARPGROUPS * kittens::WARPGROUP_WARPS;
+    // Ping-pong barriers are gated on CW >= 2; only the consumer warpgroups
+    // participate (count = CW * 128 for CW=2 → 256).
+    constexpr int PP_BARRIER_THREADS = CW * kittens::WARPGROUP_THREADS;
 
     using q_tile    =         st_bf<K::qo_height, K::tile_width>;
     using k_tile    =         st_bf<K::kv_height, K::tile_width>;
@@ -228,27 +246,42 @@ void evo_fwd_ker(const __grid_constant__ evo_fwd_globals<D, N_KIND> g) {
 
         wait(qsmem_semaphore, 0);
 
+        // FA3 ping-pong bootstrap (CW >= 2 only): WG1 hands the first MMA
+        // turn to WG0 by arriving on MMA_TOKEN, then waits on CORR_TOKEN
+        // until WG0 signals its first softmax handoff. WG0 enters the loop
+        // directly and finds MMA_TOKEN ready on the first wait.
+        if constexpr (CW >= 2) {
+            if (warpgroupid == 1) {
+                fwd_named_bar_arrive<FWD_MMA_TOKEN,  PP_BARRIER_THREADS>();
+                fwd_named_bar_sync  <FWD_CORR_TOKEN, PP_BARRIER_THREADS>();
+            }
+        }
+
         for (int kv_idx = 0; kv_idx <= kv_iters; kv_idx++) {
             const int s = kv_idx % K::stages;
             const int phase = (kv_idx / K::stages) % 2;
 
-            // Issue Q @ K^T (async); stash prev max for online-softmax correction
-            // meanwhile (runs on different registers from att_block).
+            // ===== 1) QK^T on tensor cores (exclusive when CW >= 2) =====
+            if constexpr (CW >= 2) fwd_named_bar_sync<FWD_MMA_TOKEN, PP_BARRIER_THREADS>();
+
             wait(k_smem_arrived[s], phase);
             warpgroup::mm_ABt(att_block, q_smem[warpgroupid], k_smem[s]);
             warp::copy(max_vec_last, max_vec);
             warpgroup::mma_async_wait();
 
-            // Fuse (scale * log2e) into a single multiply on att_block.
+            if constexpr (CW >= 2) fwd_named_bar_arrive<FWD_MMA_TOKEN, PP_BARRIER_THREADS>();
+
+            // ===== 2) Softmax / correction on CUDA cores + SFUs =====
+            //         (runs in parallel with the OTHER WG's QK^T MMA)
+            if constexpr (CW >= 2) fwd_named_bar_sync<FWD_CORR_TOKEN, PP_BARRIER_THREADS>();
+
             warp::mul(att_block, att_block, softmax_scale_log2);
 
-            // Add pair_bias (scale by log2(e) in registers so att stays in base-2 space).
             wait(pb_smem_arrived[s], phase);
             warpgroup::load(pb_reg, pb_smem[warpgroupid][s]);
             warp::mul(pb_reg, pb_reg, LOG2E);
             warp::add(att_block, att_block, pb_reg);
 
-            // Add res_mask (broadcast across Q rows; also log2(e)-scaled).
             wait(rm_smem_arrived[s], phase);
             warp::load(rm_reg, rm_smem[s]);
             warp::mul(rm_reg, rm_reg, LOG2E);
@@ -269,9 +302,16 @@ void evo_fwd_ker(const __grid_constant__ evo_fwd_globals<D, N_KIND> g) {
             warp::copy(att_block_mma, att_block);
             warp::mul_row(o_reg, o_reg, alpha);
 
+            if constexpr (CW >= 2) fwd_named_bar_arrive<FWD_CORR_TOKEN, PP_BARRIER_THREADS>();
+
+            // ===== 3) PV on tensor cores (exclusive when CW >= 2) =====
+            if constexpr (CW >= 2) fwd_named_bar_sync<FWD_MMA_TOKEN, PP_BARRIER_THREADS>();
+
             wait(v_smem_arrived[s], phase);
             warpgroup::mma_AB(o_reg, att_block_mma, v_smem[s]);
             warpgroup::mma_async_wait();
+
+            if constexpr (CW >= 2) fwd_named_bar_arrive<FWD_MMA_TOKEN, PP_BARRIER_THREADS>();
 
             if (warpgroup::laneid() == 0) arrive(compute_done[s], 1);
         }
@@ -949,17 +989,16 @@ evoattention_forward(at::Tensor q,
         ? static_cast<float>(softmax_scale_override)
         : 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-    auto launch = [&](auto D_tag, auto N_tag) {
-        constexpr int D      = decltype(D_tag)::value;
-        constexpr int N_KIND = decltype(N_tag)::value;
-        constexpr int D_CW = evo_fwd_tile_dims<D, N_KIND>::consumer_warpgroups;
-        constexpr int D_NUM_WORKERS = evo_num_workers<D, N_KIND>();
+    auto launch = [&](auto D_tag) {
+        constexpr int D = decltype(D_tag)::value;
+        constexpr int D_CW = evo_fwd_tile_dims<D>::consumer_warpgroups;
+        constexpr int D_NUM_WORKERS = evo_num_workers<D>();
 
         TORCH_CHECK(seq_len % (D_CW * QO_H) == 0,
                     "SEQ_LEN must be divisible by consumer_warpgroups*qo_height = ",
                     D_CW * QO_H, " for head_dim=", D);
 
-        using globals = evo_fwd_globals<D, N_KIND>;
+        using globals = evo_fwd_globals<D>;
         using q_global  = typename globals::q_gl;
         using k_global  = typename globals::k_gl;
         using v_global  = typename globals::v_gl;
@@ -985,25 +1024,17 @@ evoattention_forward(at::Tensor q,
                   static_cast<unsigned>(heads),
                   static_cast<unsigned>(batch_msa));
 
-        cudaFuncSetAttribute(evo_fwd_ker<D, N_KIND>,
+        cudaFuncSetAttribute(evo_fwd_ker<D>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              mem_size);
-        evo_fwd_ker<D, N_KIND><<<grid, 32 * D_NUM_WORKERS, mem_size, stream>>>(g);
+        evo_fwd_ker<D><<<grid, 32 * D_NUM_WORKERS, mem_size, stream>>>(g);
         CHECK_CUDA_ERROR(cudaGetLastError());
     };
 
-    // The N tag here is a divisibility witness, not the actual sequence length:
-    // tile_dims keys off (N % 192 == 0) to pick CW=3 vs CW=2 at D=64. So we pass
-    // 384 (divisible by 192) for the CW=3 path and 256 (not divisible) for CW=2.
-    // The kernel still uses g.N (runtime) for the real sequence length.
     if (head_dim == 64) {
-        if (seq_len % 192 == 0) {
-            launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 384>{});
-        } else {
-            launch(std::integral_constant<int, 64>{}, std::integral_constant<int, 256>{});
-        }
+        launch(std::integral_constant<int, 64>{});
     } else {
-        launch(std::integral_constant<int, 128>{}, std::integral_constant<int, 256>{});
+        launch(std::integral_constant<int, 128>{});
     }
 
     cudaStreamSynchronize(stream);

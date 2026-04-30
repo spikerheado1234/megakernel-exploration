@@ -32,6 +32,14 @@ except ImportError:
     _C_cw3 = None
     _HAVE_CW3 = False
 
+# Optional: experimental CW=2 ping-pong forward variant. Built via Makefile.cw4.
+try:
+    import _C_cw4
+    _HAVE_CW4 = True
+except ImportError:
+    _C_cw4 = None
+    _HAVE_CW4 = False
+
 
 # Head-dim values the CUDA kernel supports natively. Anything else is
 # zero-padded up to the next supported value on the way in; output is sliced
@@ -237,6 +245,66 @@ def tk_evo_forward_cw3(Q, K, V, res_mask, pair_bias):
         Q_tk, K_tk, V_tk, pair_bias_tk, res_mask_tk, N_SEQ, softmax_scale
     )
     # O_pad: (B*N_SEQ, H, N_PAD, D) bf16. Slice off the padded sequence rows.
+    O = O_pad[:, :, :N_CTX, :].contiguous()
+    O = O.view(B, N_SEQ, H, N_CTX, D).transpose(-2, -3).contiguous()
+    return O
+
+
+# -----------------------------------------------------------------------------
+# Experimental CW=2 ping-pong forward variant. Same shape constraints as the
+# production CW=2 path: SEQ_LEN must be a multiple of lcm(CW*qo_height,
+# kv_height) = 128. No internal padding — caller is responsible for shape.
+#
+# Forward only — used by benchmark/test to compare against the production
+# CW=2 forward (which uses the same kernel structure but no ping-pong).
+# -----------------------------------------------------------------------------
+
+CW4_PAD_MULTIPLE = 128
+
+
+def tk_evo_forward_cw4(Q, K, V, res_mask, pair_bias):
+    """Forward-only ping-pong CW=2 EvoAttention. Same input layout as TKEvoAttention."""
+    if not _HAVE_CW4:
+        raise RuntimeError(
+            "CW=2 ping-pong module not built. Run `make -f Makefile.cw4` in this directory."
+        )
+
+    B, N_SEQ, N_CTX, H, D = Q.shape
+    assert D == 64, "CW=2 ping-pong variant only supports head_dim=64"
+    assert K.shape == (B, N_SEQ, N_CTX, H, D)
+    assert V.shape == (B, N_SEQ, N_CTX, H, D)
+    assert res_mask.shape == (B, N_SEQ, 1, 1, N_CTX)
+    assert pair_bias.shape == (B, 1, H, N_CTX, N_CTX)
+
+    bf16 = torch.bfloat16
+
+    def to_tk_qkv(x):
+        x = x.to(bf16) if x.dtype != bf16 else x
+        return x.transpose(-2, -3).contiguous().view(B * N_SEQ, H, N_CTX, D)
+
+    Q_tk = to_tk_qkv(Q)
+    K_tk = to_tk_qkv(K)
+    V_tk = to_tk_qkv(V)
+    pair_bias_tk = pair_bias.squeeze(1).contiguous().to(bf16)
+    res_mask_tk  = res_mask.reshape(B * N_SEQ, 1, 1, N_CTX).contiguous().to(bf16)
+
+    n_pad_total = (CW4_PAD_MULTIPLE - (N_CTX % CW4_PAD_MULTIPLE)) % CW4_PAD_MULTIPLE
+    if n_pad_total != 0:
+        Q_tk = F.pad(Q_tk, (0, 0, 0, n_pad_total), value=0.0).contiguous()
+        K_tk = F.pad(K_tk, (0, 0, 0, n_pad_total), value=0.0).contiguous()
+        V_tk = F.pad(V_tk, (0, 0, 0, n_pad_total), value=0.0).contiguous()
+        pair_bias_tk = F.pad(
+            pair_bias_tk, (0, n_pad_total, 0, n_pad_total), value=0.0
+        ).contiguous()
+        res_mask_tk = F.pad(
+            res_mask_tk, (0, n_pad_total), value=-1e9
+        ).contiguous()
+
+    softmax_scale = 1.0 / (D ** 0.5)
+
+    O_pad, _L = _C_cw4.evoattention_forward_cw4(
+        Q_tk, K_tk, V_tk, pair_bias_tk, res_mask_tk, N_SEQ, softmax_scale
+    )
     O = O_pad[:, :, :N_CTX, :].contiguous()
     O = O.view(B, N_SEQ, H, N_CTX, D).transpose(-2, -3).contiguous()
     return O
