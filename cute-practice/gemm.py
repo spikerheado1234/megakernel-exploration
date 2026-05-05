@@ -33,14 +33,11 @@ def gemm_v1(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
         right_mat_shmem[(tidx, tidy)] = right[((tidx, tidy), (k, bidy))] 
 
         cute.arch.sync_threads()
-        if tidx == 0 and tidy == 0 and bidx == 0 and bidy == 0 and k == 0: 
-            cute.printf("left_mat_shmem: {}", left_mat_shmem)
-            cute.printf("right_mat_shmem: {}", right_mat_shmem)
-            cute.printf("answer_shmem: {}", answer_shmem)
 
         for k_iter in range(left.shape[0][1]):
             ## Then we do a matmul ##
-            internal_value += (left_mat_shmem[(tidx, k_iter)] * right_mat_shmem[(k_iter, tidy)]).to(cutlass.Float32)
+            #internal_value += (left_mat_shmem[(tidx, k_iter)] * right_mat_shmem[(k_iter, tidy)]).to(cutlass.Float32)
+            internal_value += (left_mat_shmem[(tidx, k_iter)].to(cutlass.Float32) * right_mat_shmem[(k_iter, tidy)].to(cutlass.Float32))
             #answer_shmem[(tidy, tidx)] += left_mat_shmem[(tidy, k_iter)] * right_mat_shmem[(k_iter, tidx)]
 
         cute.arch.sync_threads()
@@ -99,4 +96,3 @@ if __name__ == '__main__':
 
     print(f'out: {c}, truth: {truth}')
     print(f'is_corect: {torch.allclose(c, truth, atol=1e-2, rtol=1e-2)}')
-    print(f'max: {torch.abs(c - truth).max()}')
