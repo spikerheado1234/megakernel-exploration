@@ -6,7 +6,7 @@ import torch
 @cute.kernel
 def gemm_v2(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
                 M: cutlass.Int32, N: cutlass.Int32, K: cutlass.Int32,
-                tv_lytA: cute.Layout, tv_lytB: cute.Layout, tv_lytC: cute.Layout, thr_C: cute.Layout,
+                tv_lytA: cute.Layout, tv_lytB: cute.Layout, tv_lytC: cute.Layout, val_C: cute.Layout,
                 BLKM: cutlass.Constexpr, BLKN: cutlass.Constexpr, BLKK: cutlass.Constexpr):
     """
     Uses tv_layouts to make separation of concerns palatable.
@@ -17,6 +17,9 @@ def gemm_v2(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
     bidx, bidy, _ = cute.arch.block_idx()
     gidx, gidy, _ = cute.arch.block_dim()
 
+    if tidx == 0 and tidy == 0 and bidx == 0 and bidy == 0:
+        cute.printf('gidx: {}, gidy: {}', gidx, gidy)
+
     alloc = cutlass.utils.SmemAllocator()
     left_lyt = cute.make_layout(shape=(BLKM, BLKK), stride=(BLKK, 1))
     right_lyt = cute.make_layout(shape=(BLKK, BLKN), stride=(BLKN, 1))
@@ -24,11 +27,12 @@ def gemm_v2(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
     leftSmem = alloc.allocate_tensor(cutlass.BFloat16, layout=left_lyt, swizzle=None)
     rightSmem = alloc.allocate_tensor(cutlass.BFloat16, layout=right_lyt, swizzle=None)
 
+    print(f'rightSmem layout: {rightSmem.layout}')
+
     answerSmem = alloc.allocate_tensor(cutlass.BFloat16, layout=answer_lyt, swizzle=None)
 
-    ## Think about why this could go wrong then. ##
+    ## Recover base tid. ##
     tid = tidx + tidy * gidx
-    tid = tidx + tidy * thr_C.shape[0]
 
     ## What is the implication of using one over the other? In the above? ##
 
@@ -37,19 +41,22 @@ def gemm_v2(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
     sB = cute.composition(rightSmem, tv_lytB)
 
     ## Next, we get the view for computing the matmul. ##
-    compA = cute.local_partition(leftSmem, thr_C, tid, proj=(1, None))
-    compB = cute.local_partition(rightSmem, thr_C, tid, proj=(None, 1))
+    compA = cute.local_tile(leftSmem, (val_C.shape[0], BLKK), (tidy, 0))
+    compB = cute.local_tile(rightSmem, (BLKK, val_C.shape[1]), (0, tidx))
+
+    ## For writing, create composition and register file to match view of output. ##
+    bC = cute.composition(answer[((None, None), (bidy, bidx))], tv_lytC)
 
     ## Finally, we make the regsiter file. ##
-    answerRegs = cute.make_fragment(cute.make_layout(shape=(8,2), stride=(2,1)), cutlass.Float32)
+    answerRegs = cute.make_fragment_like(bC[(tid, None)], cutlass.Float32)
 
     answerRegs.fill(0.0)
 
     for k in range(left.shape[1][1]):
-
+        
         ## load into shmem. ##
         bA = left[((None, None), (bidy, k))]
-        bB = right[((None, None), (k, bidy))]
+        bB = right[((None, None), (k, bidx))]
 
         refA = cute.composition(bA, tv_lytA) 
         refB = cute.composition(bB, tv_lytB)
@@ -58,21 +65,22 @@ def gemm_v2(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
         sB[(tid, None)] = refB[(tid, None)].load()
 
         cute.arch.sync_threads()
+        ## Ok, loads into shmem are ok globally, now how is the thread-layout occuring? ##
+        if k == 0 and bidx == 2 and bidy == 1 and tidx == 0 and tidy == 0:
+            cute.printf('compA: {}', compA)
+            cute.printf('compB: {}', compB)
 
         ## finally, we can do the physical matmul. ##
-        for m_iter in range(compA.shape[0]):
-            for n_iter in range(compB.shape[1]):
+        for n_iter in range(compB.shape[1]):
+            for m_iter in range(compA.shape[0]):
                 for k_iter in range(compA.shape[1]):
-                    answerRegs[(m_iter, n_iter)] += compA[(m_iter, k_iter)].to(cutlass.Float32) * compB[(k_iter, n_iter)].to(cutlass.Float32)
+                    answerRegs[((n_iter, m_iter),)] += compA[(m_iter, k_iter)].to(cutlass.Float32) * compB[(k_iter, n_iter)].to(cutlass.Float32)
 
         cute.arch.sync_threads()
 
     ## Lastly, we have to store back to gmem. ##
 
-    ## Step one, create composition. ##
-    bC = cute.composition(answer[((None, None), (bidy, bidx))], tv_lytC)
-
-    bC[(tid, None)] = answerRegs.load().to(cutlass.BFloat16)  ## is this correct?
+    bC[(tid, None)] = answerRegs.load().to(cutlass.BFloat16)
 
 @cute.kernel
 def gemm_v1(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
@@ -179,18 +187,26 @@ def wrapper_gemm_v2(a_ : cute.Tensor, b_: cute.Tensor, c_: cute.Tensor):
     tB = cute.zipped_divide(b_, b_tiler)
     tC = cute.zipped_divide(c_, c_tiler)
 
+    cute.printf('a_tiler: {}, b_tiler: {}, c_tiler: {}', a_tiler, b_tiler, c_tiler)
+    grid=(cute.size(tC, mode=[1, 1]), cute.size(tC, mode=[1, 0]))
+    print(f'grid size: {grid}')
+
     gemm_v2(tA, tB, tC, M, N, K, tv_layout_a, tv_layout_b, tv_layout_c,
-            thr_layout_c,c_tiler[0],c_tiler[1],b_tiler[0]).launch(
-            grid=(cute.size(tC, mode=[1, 0]), cute.size(tC, mode=[1, 1])),
-            block=(8, 16, 1)
+            val_layout_c,c_tiler[0],c_tiler[1],b_tiler[0]).launch(
+            grid=(cute.size(tC, mode=[1, 1]), cute.size(tC, mode=[1, 0])),
+            block=(16, 8, 1)
             )
 
+    torch.cuda.synchronize()
 
 if __name__ == '__main__':
     ## Here we launch some simple test cases. ##
+    torch.manual_seed(42)
     a = torch.randn(128, 128, device='cuda', dtype=torch.bfloat16)
     b = torch.randn(128, 128, device='cuda', dtype=torch.bfloat16)
     c = torch.zeros(a.shape[0], b.shape[1], device='cuda', dtype=torch.bfloat16)
+
+    print(f'a: {a[64:64+8, :16]}, b: {b[:16, 32*2:32*2+2]}')
 
     a_ = from_dlpack(a)
     b_= from_dlpack(b)
@@ -203,6 +219,8 @@ if __name__ == '__main__':
     comp_fn(a_, b_, c_)
 
     truth = torch.einsum('ab,bc->ac',a,b)
+    print(f'truth sliced: {truth[64:64+8, 32*2:32*2+2]}')
+    print(f'out sliced: {c[64:64+8,32*2:32*2+2]}')
 
     print(f'out: {c}, truth: {truth}')
     print(f'is_corect: {torch.allclose(c, truth, atol=1e-2, rtol=1e-2)}')
