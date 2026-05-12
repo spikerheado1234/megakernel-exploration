@@ -3,6 +3,113 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 import torch
 
+#######################################################################
+##  Multi-part CuTe-DSL kernels building up to TMA + WGMMA usage.
+#######################################################################
+
+@cute.kernel
+def gemm_v3a(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor, ## At this point, what is the layout of left, right and answer?
+                M: cutlass.Int32, N: cutlass.Int32, K: cutlass.Int32,
+                tv_lyt_A: cute.Layout, tv_lyt_B: cute.Layout, 
+                tv_lyt_C, val_lyt_C: cute.Layout,
+                tma_atom_left: cute.CopyAtom, tma_atom_right: cute.CopyAtom,
+                BLKM: cutlass.Constexpr, BLKN: cutlass.Constexpr, BLKK: cutlass.Constexpr):
+    """
+    Uses tv_layouts and TMA to start having a more performant kernel.
+    """
+
+    ## Some preprocessing to get the layouts in the right mode. ##
+    tidx, tidy, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()
+    gidx, gidy, _ = cute.arch.block_dim()
+
+    alloc = cutlass.utils.SmemAllocator()
+    left_lyt = cute.make_layout(shape=(BLKM, BLKK), stride=(BLKK, 1))
+    right_lyt = cute.make_layout(shape=(BLKK, BLKN), stride=(BLKN, 1))
+    answer_lyt = cute.make_layout(shape=(BLKM, BLKN), stride=(BLKN, 1))
+
+    leftSmem = alloc.allocate_tensor(cutlass.BFloat16, layout=left_lyt, swizzle=None)
+    rightSmem = alloc.allocate_tensor(cutlass.BFloat16, layout=right_lyt, swizzle=None)
+    answerSmem = alloc.allocate_tensor(cutlass.BFloat16, layout=answer_lyt, swizzle=None)
+
+    ## Next, we initialize the memory bars for TMA. ##
+    mbar = alloc.allocate_array(cutlass.Int64, num_elems=1)
+
+    ## Recover base tid. ##
+    tid = tidx + tidy * gidx
+
+    ## First initialize the memory barrier. ##
+    if tid == 0:
+        cute.arch.mbarrier_init(mbar, 1)
+    cute.arch.mbarrier_init_fence()
+    cute.arch.cluster_arrive_relaxed()
+    cute.arch.cluster_wait()
+    cute.arch.sync_threads()
+
+    ## Now, we prepare the TMA partition.
+    sA_grp = cute.group_modes(leftSmem, 0, 2)
+    sB_grp = cute.group_modes(rightSmem, 0, 2)
+
+    tma_left_lyt = cute.local_tile(left, (BLKM, BLKK), (bidy, None))
+    tma_left_lyt = cute.group_modes(tma_left_lyt, 0, 2)
+    tma_right_lyt = cute.local_tile(right, (BLKK, BLKN), (None, bidx))
+    tma_right_lyt = cute.group_modes(tma_right_lyt, 0, 2)
+
+    left_grp = cute.group_modes(tma_left_lyt, 0, 2)
+    right_grp = cute.group_modes(tma_right_lyt, 0, 2)
+
+    tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_left, (0,), cute.make_layout((1,)), sA_grp, tma_left_lyt
+            )
+
+    tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_right, (0,), cute.make_layout((1,)), sB_grp, tma_right_lyt 
+            )
+
+    ### Next, we get the view for computing the matmul. ##
+
+    ## Now we get compA and compB. Cute layouts for smem -> regs for matmul. ##
+    compA = cute.local_tile(leftSmem, (val_lyt_C.shape[0], BLKK), (bidy, 0))
+    compB = cute.local_tile(rightSmem, (BLKK, val_lyt_C.shape[-1]), (0, bidx))
+
+    ## Finally, we instantiate the register file to store output. ##
+    gC_base = cute.composition(answer[None, (bidy, bidx)], tv_lyt_C) # ((64, 32) : (32, 1)) o tv_layout.
+
+    answerRegs = cute.make_fragment_like(gC_base[(tid, None)], dtype=cutlass.Float32)
+
+    answerRegs.fill(0.0)
+
+    phase = 0
+    if tid == 0:
+        cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_left)
+        cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_right)
+
+    cute.arch.sync_threads()
+
+    for k in range(tAgA.shape[0][-1]):
+
+        ## Then we have to load data. ##
+        if tid == 0:
+            cute.arch.mbarrier_arrive_and_expect_tx(mbar, (BLKK * BLKM + BLKK * BLKN) * 2)
+            cute.copy(tma_atom_left, tAgA[(None, k)], tAsA, tma_bar_ptr=mbar)
+            cute.copy(tma_atom_right, tBgB[(None, k)], tBsB, tma_bar_ptr=mbar)
+
+        cute.printf('tid: {}, bidy: {}, bidx: {} A', tid, bidy, bidx)
+        ## Then we have to wait on the phase of the mbar to flip. ##
+        cute.arch.mbarrier_wait(mbar, phase)
+        cute.printf('tid: {}, bidy: {}, bidx: {} B', tid, bidy, bidx)
+
+        ## Finally, we do the gemm here. ##
+        for m_iter in range(val_lyt_C.shape[0]):
+            for n_iter in range(val_lyt_C.shape[1]):
+                for k_iter in range(BLKK):
+                    answerRegs[((n_iter, m_iter),)] += compA[(m_iter, k_iter)].to(cutlass.Float32) * compB[(k_iter, n_iter)].to(cutlass.Float32)
+
+        phase ^= 1
+
+    ## finally we store to memory. ##
+    gC_base[(tid, None)] = answerRegs.load().to(cutlass.BFloat16)
+
 @cute.kernel
 def gemm_v2(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
                 M: cutlass.Int32, N: cutlass.Int32, K: cutlass.Int32,
@@ -17,17 +124,12 @@ def gemm_v2(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
     bidx, bidy, _ = cute.arch.block_idx()
     gidx, gidy, _ = cute.arch.block_dim()
 
-    if tidx == 0 and tidy == 0 and bidx == 0 and bidy == 0:
-        cute.printf('gidx: {}, gidy: {}', gidx, gidy)
-
     alloc = cutlass.utils.SmemAllocator()
     left_lyt = cute.make_layout(shape=(BLKM, BLKK), stride=(BLKK, 1))
     right_lyt = cute.make_layout(shape=(BLKK, BLKN), stride=(BLKN, 1))
     answer_lyt = cute.make_layout(shape=(BLKM, BLKN), stride=(BLKN, 1))
     leftSmem = alloc.allocate_tensor(cutlass.BFloat16, layout=left_lyt, swizzle=None)
     rightSmem = alloc.allocate_tensor(cutlass.BFloat16, layout=right_lyt, swizzle=None)
-
-    print(f'rightSmem layout: {rightSmem.layout}')
 
     answerSmem = alloc.allocate_tensor(cutlass.BFloat16, layout=answer_lyt, swizzle=None)
 
@@ -50,6 +152,8 @@ def gemm_v2(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
     ## Finally, we make the regsiter file. ##
     answerRegs = cute.make_fragment_like(bC[(tid, None)], cutlass.Float32)
 
+    if tidx == 0 and tidy == 0 and bidx == 0 and bidy == 0:
+        cute.printf('regsLayout: {}', answerRegs.layout)
     answerRegs.fill(0.0)
 
     for k in range(left.shape[1][1]):
@@ -65,10 +169,6 @@ def gemm_v2(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
         sB[(tid, None)] = refB[(tid, None)].load()
 
         cute.arch.sync_threads()
-        ## Ok, loads into shmem are ok globally, now how is the thread-layout occuring? ##
-        if k == 0 and bidx == 2 and bidy == 1 and tidx == 0 and tidy == 0:
-            cute.printf('compA: {}', compA)
-            cute.printf('compB: {}', compB)
 
         ## finally, we can do the physical matmul. ##
         for n_iter in range(compB.shape[1]):
@@ -187,9 +287,7 @@ def wrapper_gemm_v2(a_ : cute.Tensor, b_: cute.Tensor, c_: cute.Tensor):
     tB = cute.zipped_divide(b_, b_tiler)
     tC = cute.zipped_divide(c_, c_tiler)
 
-    cute.printf('a_tiler: {}, b_tiler: {}, c_tiler: {}', a_tiler, b_tiler, c_tiler)
     grid=(cute.size(tC, mode=[1, 1]), cute.size(tC, mode=[1, 0]))
-    print(f'grid size: {grid}')
 
     gemm_v2(tA, tB, tC, M, N, K, tv_layout_a, tv_layout_b, tv_layout_c,
             val_layout_c,c_tiler[0],c_tiler[1],b_tiler[0]).launch(
@@ -199,6 +297,65 @@ def wrapper_gemm_v2(a_ : cute.Tensor, b_: cute.Tensor, c_: cute.Tensor):
 
     torch.cuda.synchronize()
 
+@cute.jit
+def wrapper_gemm_v3a(a_: cute.Tensor, b_: cute.Tensor, c_: cute.Tensor):
+    """
+    A simple TMA path.
+    """
+    M, K = a_.shape
+    _, N = b_.shape
+
+    ## First we build the TMA atom. ##
+
+    ## To do this, we encode the shmem sizes. ##
+
+    ## We keep smemA = [64, 16] & smemB = [16, 32].
+    BLKM, BLKN, BLKK= 64, 32, 16
+    smemA_lyt = cute.make_layout(shape=(BLKM, BLKK), stride=(16, 1))
+    smemB_lyt = cute.make_layout(shape=(BLKK, BLKN), stride=(32, 1))
+
+    ## Next we build the TMA atom. ##
+    op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+    tma_atom_a, tma_tensor_a = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                op, a_, smemA_lyt, (BLKM, BLKK)
+            )
+    tma_atom_b, tma_tensor_b = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                op, b_, smemB_lyt, (BLKK, BLKN)
+            )
+
+    ## We still need to manipulate smem right, so we need tv_layouts generated. ##
+    thr_A_lyt = cute.make_layout((8, 16))
+    val_A_lyt = cute.make_layout((8, 1))
+
+    tiler_a, tv_lyt_a = cute.make_layout_tv(thr_A_lyt, val_A_lyt)
+
+    thr_B_lyt = cute.make_layout((8, 16))
+    val_B_lyt = cute.make_layout((2, 2))
+
+    tiler_b, tv_lyt_b = cute.make_layout_tv(thr_B_lyt, val_B_lyt)
+
+    ## We no longer need to TV partition A/B, but let's partition C ##
+    ##  and avoid using TMA to store to C. ##
+    thr_C_lyt = cute.make_layout(shape=(8, 16), stride=(16, 1))
+    val_C_lyt = cute.make_layout(shape=(8, 2), stride=(2, 1))
+
+    tiler_c, tv_c = cute.make_layout_tv(thr_C_lyt, val_C_lyt)
+
+    tC = cute.zipped_divide(c_, tiler_c)
+
+    ## Let's see what things look like here. ##
+    print(f'tma_tensor_a: {tma_tensor_a}')
+    print(f'tma_tensor_b: {tma_tensor_b}')
+    print(f'tma_atom_a: {tma_atom_a}')
+    print(f'tiler_c: {tiler_c}, tv_c: {tv_c}, layout_c: {tC}')
+
+    ## We launch the gemm. ##
+    gemm_v3a(tma_tensor_a, tma_tensor_b, tC, M, N, K, tv_lyt_a, tv_lyt_b, tv_c, val_C_lyt,
+                tma_atom_a, tma_atom_b, BLKM, BLKN, BLKK).launch(
+                grid=(cute.size(tC, mode=[1, 1]), cute.size(tC, mode=[1, 0]), 1),
+                block=(16, 8 + 2, 1) ## We spawn an extra warp for issuing TMA only.
+            )
+
 if __name__ == '__main__':
     ## Here we launch some simple test cases. ##
     torch.manual_seed(42)
@@ -206,21 +363,19 @@ if __name__ == '__main__':
     b = torch.randn(128, 128, device='cuda', dtype=torch.bfloat16)
     c = torch.zeros(a.shape[0], b.shape[1], device='cuda', dtype=torch.bfloat16)
 
-    print(f'a: {a[64:64+8, :16]}, b: {b[:16, 32*2:32*2+2]}')
-
     a_ = from_dlpack(a)
     b_= from_dlpack(b)
     c_ = from_dlpack(c)
     BLK_M, BLK_N, BLK_K = 10, 10, 10
 
     #comp_fn = cute.compile(wrapper_gemm_simple, a_, b_, c_, BLK_M, BLK_N, BLK_K)
-    comp_fn = cute.compile(wrapper_gemm_v2, a_, b_, c_)
+    comp_fn = cute.compile(wrapper_gemm_v3a, a_, b_, c_)
 
     comp_fn(a_, b_, c_)
 
-    truth = torch.einsum('ab,bc->ac',a,b)
-    print(f'truth sliced: {truth[64:64+8, 32*2:32*2+2]}')
-    print(f'out sliced: {c[64:64+8,32*2:32*2+2]}')
+    #truth = torch.mm(a, b)
+    #truth = torch.einsum('ab,bc->ac',a,b)
 
-    print(f'out: {c}, truth: {truth}')
-    print(f'is_corect: {torch.allclose(c, truth, atol=1e-2, rtol=1e-2)}')
+    #print(f'out: {c}, truth: {truth}')
+    print(f'{c}')
+    #print(f'is_corect: {torch.allclose(c, truth, atol=1e-2, rtol=1e-2)}')

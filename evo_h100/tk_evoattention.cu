@@ -1,7 +1,12 @@
 // ThunderKittens H100 kernel for AlphaFold-3 style attention
 // (pair-bias + residue-mask triangle / pair-bias attention).
 //
-// Forward pass only. Semantics mirror the Triton reference kernel at
+// Forward and backward passes. The backward wrapper does runtime algorithmic
+// selection: at D=64 with seq_len <= 512 we dispatch the mma.sync (m16n8k16)
+// kernel `evo_bwd_mma_ker` (higher CTAs/SM, faster at small N); at larger N
+// or at D=128 we dispatch the WGMMA kernel `evo_bwd_ker`.
+//
+// Semantics mirror the Triton reference kernel at
 //   MegaFold/megafold/model/FusedEvoAttention/evoattention.py
 //
 // Tensor layout convention (all 4D after flattening B*N_SEQ):
@@ -434,20 +439,30 @@ void evo_bwd_prep_ker(const __grid_constant__ evo_bwd_prep_globals<D> g) {
 //      with the added pair_bias buffer; kept same tile_h_qo / tile_h = 64 as the base.
 // =========================================================================================
 
+// Backward kernel parameters. NOTE the production wrapper has TWO bwd kernels:
+//   * `evo_bwd_ker`     — WGMMA (uses `consumer_warpgroups`, `blocks_sm`)
+//   * `evo_bwd_mma_ker` — mma.sync (uses `mma_blocks_sm`)
+// They live on different kernels and are sized independently to fit each
+// kernel's smem footprint (WGMMA ~130KB → 1 CTA/SM; mma ~89KB → 2 CTAs/SM).
+// `mma_seq_cutoff` selects which kernel runs at runtime: seq_len ≤ cutoff → mma.
 template<int D> struct evo_bwd_tile_dims {};
 template<> struct evo_bwd_tile_dims<64> {
     constexpr static int tile_width          = 64;
     constexpr static int tile_h               = 64;
     constexpr static int tile_h_qo            = 64;
-    constexpr static int consumer_warpgroups  = 2;   // CW=2 at D=64: ~130 KB smem, 2× CTAs for dK/dV.
-    constexpr static int blocks_sm            = 1;
+    constexpr static int consumer_warpgroups  = 2;     // WGMMA path (CW=2)
+    constexpr static int blocks_sm            = 1;     // WGMMA path: smem ~130KB → 1
+    constexpr static int mma_blocks_sm        = 1;     // mma path:  smem ~89KB  → up to 2
+    constexpr static int mma_seq_cutoff       = 1024;   // seq_len ≤ this picks mma kernel
 };
 template<> struct evo_bwd_tile_dims<128> {
     constexpr static int tile_width          = 128;
     constexpr static int tile_h               = 64;
     constexpr static int tile_h_qo            = 64;
-    constexpr static int consumer_warpgroups  = 1;   // CW=1 at D=128: smem limits prevent CW=2.
+    constexpr static int consumer_warpgroups  = 1;     // CW=1 at D=128: smem limits prevent CW=2.
     constexpr static int blocks_sm            = 1;
+    constexpr static int mma_blocks_sm        = 1;     // mma path not specialized for D=128
+    constexpr static int mma_seq_cutoff       = 0;     // disable mma path at D=128
 };
 
 template<int D>
@@ -607,6 +622,286 @@ evo_atomic_add_dpair_bias(const rt_fl<16, 64> &ds_block_t,
         atomicAdd(dpb_base_bh + (q_hi + 1) * N + kv_abs0, ds_block_t.tiles[0][i].data[2].y);
         atomicAdd(dpb_base_bh + (q_hi + 0) * N + kv_abs1, ds_block_t.tiles[0][i].data[3].x);
         atomicAdd(dpb_base_bh + (q_hi + 1) * N + kv_abs1, ds_block_t.tiles[0][i].data[3].y);
+    }
+}
+
+// =========================================================================================
+// mma.sync backward kernel (D=64 only). Selected at runtime by the wrapper for
+// seq_len <= 512 — at small N the higher CTAs/SM (2 vs WGMMA's 1) wins; at
+// larger N WGMMA wins on raw tensor-core throughput.
+//
+// CW=1 (1 consumer warpgroup, 4 warps × 32 threads); each consumer warp owns
+// rows [16w, 16w+16) of the 64-row kv tile and shares the full 64-row qo tile.
+// Replaces all warpgroup::mm_*/mma_* with kittens::warp::mma_* (m16n8k16
+// mma.sync.aligned). __launch_bounds__(256, 2).
+// =========================================================================================
+
+template<int D>
+__global__ __launch_bounds__(8 * kittens::WARP_THREADS, evo_bwd_tile_dims<D>::mma_blocks_sm)  // 256 thr (1 producer + 1 consumer wg)
+void evo_bwd_mma_ker(const __grid_constant__ evo_bwd_globals<D> g) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+
+    const int N       = g.N;
+    const int N_SEQ   = g.N_SEQ;
+    const float scale = g.scale;
+    using G = evo_bwd_tile_dims<D>;
+    constexpr int NUM_WARPGROUPS = 2;  // hardcoded: this kernel always uses CW=1
+
+    using kg_tile = st_fl<G::tile_h,    G::tile_width>;
+    using vg_tile = st_fl<G::tile_h,    G::tile_width>;
+    using k_tile  = st_bf<G::tile_h,    G::tile_width>;
+    using v_tile  = st_bf<G::tile_h,    G::tile_width>;
+    using q_tile  = st_bf<G::tile_h_qo, G::tile_width>;
+    using og_tile = st_bf<G::tile_h_qo, G::tile_width>;
+    using qg_tile = st_fl<G::tile_h_qo, G::tile_width>;
+    using l_tile  = row_vec<st_fl<G::tile_h_qo, G::tile_h>>;
+    using d_tile  = row_vec<st_fl<G::tile_h_qo, G::tile_h>>;
+    using attn_tile = st_bf<G::tile_h_qo, G::tile_h>;
+    using pb_tile   = st_bf<G::tile_h_qo, G::tile_h>;
+    using rm_vec    = sv_bf<G::tile_h>;
+
+    k_tile   (&k_smem)        = al.allocate<k_tile>();
+    v_tile   (&v_smem)        = al.allocate<v_tile>();
+    q_tile   (&q_smem) [2]    = al.allocate<q_tile,  2>();
+    og_tile  (&og_smem)[2]    = al.allocate<og_tile, 2>();
+    qg_tile  (&qg_smem)       = al.allocate<qg_tile>();
+    l_tile   (&l_smem) [2]    = al.allocate<l_tile,    2>();
+    d_tile   (&d_smem) [2]    = al.allocate<d_tile,    2>();
+    attn_tile(&ds_smem)       = al.allocate<attn_tile>();
+    pb_tile  (&pb_smem)[2]    = al.allocate<pb_tile,   2>();
+    rm_vec   (&rm_smem)       = al.allocate<rm_vec>();
+
+    kg_tile *kg_smem = reinterpret_cast<kg_tile*>(&k_smem.data[0]);
+    vg_tile *vg_smem = reinterpret_cast<vg_tile*>(&q_smem[0].data[0]);
+
+    const int warpid        = kittens::warpid();
+    const int warpgroupid   = warpid / kittens::WARPGROUP_WARPS;
+    const int warp_in_wg    = warpid % kittens::WARPGROUP_WARPS;
+    const int qo_blocks     = N / G::tile_h_qo;
+    const int batch_msa_idx = blockIdx.z;
+    const int head_idx      = blockIdx.y;
+    const int kv_block      = blockIdx.x;
+    const int batch_idx     = batch_msa_idx / N_SEQ;
+
+    const int64_t N64 = static_cast<int64_t>(N);
+    float* dpb_base_bh = g.d_pair_bias
+                        + static_cast<int64_t>(batch_idx) * static_cast<int64_t>(g.H) * N64 * N64
+                        + static_cast<int64_t>(head_idx)  * N64 * N64;
+
+    __shared__ kittens::semaphore kv_b, rm_b, q_b[2], o_b[2], vec_b[2], pb_b[2];
+    __shared__ kittens::semaphore compute_done[2], qg_ready;
+
+    int tic = 0, toc = 1;
+    const int q_start = 0;
+
+    if (threadIdx.x == 0) {
+        init_semaphore(kv_b,     0, 1);
+        init_semaphore(rm_b,     0, 1);
+        init_semaphore(qg_ready, 1, 0);
+        for (int s = 0; s < 2; s++) {
+            init_semaphore(q_b[s],   0, 1);
+            init_semaphore(o_b[s],   0, 1);
+            init_semaphore(vec_b[s], 0, 1);
+            init_semaphore(pb_b[s],  0, 1);
+            init_semaphore(compute_done[s], 1, 0);
+        }
+        coord<k_tile> tile_idx = {batch_msa_idx, head_idx, kv_block, 0};
+        tma::expect_bytes(kv_b, sizeof(k_smem) + sizeof(v_smem));
+        tma::load_async(k_smem, g.k, tile_idx, kv_b);
+        tma::load_async(v_smem, g.v, tile_idx, kv_b);
+
+        coord<rm_vec> rm_idx = {batch_msa_idx, 0, 0, kv_block};
+        tma::expect_bytes(rm_b, sizeof(rm_vec));
+        tma::load_async(rm_smem, g.rm, rm_idx, rm_b);
+
+        coord<q_tile> q_tile_idx = {batch_msa_idx, head_idx, q_start, 0};
+        tma::expect_bytes(q_b[tic],   sizeof(q_smem[0]));
+        tma::load_async(q_smem[tic],  g.q,  q_tile_idx, q_b[tic]);
+        tma::expect_bytes(o_b[tic],   sizeof(og_smem[0]));
+        tma::load_async(og_smem[tic], g.og, q_tile_idx, o_b[tic]);
+
+        coord<l_tile> vec_idx = {batch_msa_idx, head_idx, 0, q_start};
+        tma::expect_bytes(vec_b[tic], sizeof(l_smem[0]) + sizeof(d_smem[0]));
+        tma::load_async(l_smem[tic], g.l, vec_idx, vec_b[tic]);
+        tma::load_async(d_smem[tic], g.d, vec_idx, vec_b[tic]);
+
+        tma::expect_bytes(pb_b[tic], sizeof(pb_tile));
+        coord<pb_tile> pb_tile_idx = {batch_idx, head_idx, q_start, kv_block};
+        tma::load_async(pb_smem[tic], g.pb, pb_tile_idx, pb_b[tic]);
+    }
+    __syncthreads();
+
+    if (warpgroupid == NUM_WARPGROUPS - 1) {
+        // ----- Producer warpgroup -----
+        warpgroup::decrease_registers<24>();
+
+        if (warp_in_wg == 0) {
+            for (int qo_idx = q_start; qo_idx < qo_blocks; qo_idx++, tic ^= 1, toc ^= 1) {
+                if (qo_idx + 1 < qo_blocks) {
+                    coord<q_tile> tile_idx = {batch_msa_idx, head_idx, qo_idx + 1, 0};
+                    warp::tma::expect_bytes(q_b[toc],   sizeof(q_smem[0]));
+                    warp::tma::load_async(q_smem[toc],  g.q,  tile_idx, q_b[toc]);
+                    warp::tma::expect_bytes(o_b[toc],   sizeof(og_smem[0]));
+                    warp::tma::load_async(og_smem[toc], g.og, tile_idx, o_b[toc]);
+
+                    coord<l_tile> vec_idx = {batch_msa_idx, head_idx, 0, qo_idx + 1};
+                    warp::tma::expect_bytes(vec_b[toc], sizeof(l_smem[0]) + sizeof(d_smem[0]));
+                    warp::tma::load_async(l_smem[toc], g.l, vec_idx, vec_b[toc]);
+                    warp::tma::load_async(d_smem[toc], g.d, vec_idx, vec_b[toc]);
+
+                    warp::tma::expect_bytes(pb_b[toc], sizeof(pb_tile));
+                    coord<pb_tile> pb_tile_idx = {batch_idx, head_idx, qo_idx + 1, kv_block};
+                    warp::tma::load_async(pb_smem[toc], g.pb, pb_tile_idx, pb_b[toc]);
+                }
+                wait(compute_done[tic], ((qo_idx - q_start)/2)%2);
+            }
+        }
+        else if (warp_in_wg == 1) {
+            for (int qo_idx = q_start; qo_idx < qo_blocks; qo_idx++, tic ^= 1, toc ^= 1) {
+                wait(compute_done[tic], ((qo_idx - q_start)/2)%2);
+                coord<qg_tile> tile_idx = {batch_msa_idx, head_idx, qo_idx, 0};
+                warp::tma::store_add_async(g.qg, qg_smem, tile_idx);
+                warp::tma::store_async_wait();
+                if (laneid() == 0) arrive(qg_ready);
+            }
+        }
+    }
+    else {
+        // ----- Consumer warpgroup (4 warps, each owns 16 rows of kv) -----
+        // launch_bounds(256, 2) → 128 regs/thread avg. Producer keeps 24, consumer
+        // can claim (32768 - 24*128) / 128 = 232 regs/thread.
+        warpgroup::increase_registers<232>();
+
+        rt_fl<16, G::tile_width>            kg_reg, vg_reg;
+        rt_fl<16, G::tile_h_qo>             s_block_t,  p_block_t;
+        rt_fl<16, G::tile_h_qo>             ds_block_t, dp_block_t;
+        rt_bf<16, G::tile_h_qo>             p_block_t_mma, ds_block_t_mma;
+
+        rt_bf<16, G::tile_width, ducks::rt_layout::row> k_warp_bf, v_warp_bf;
+
+        warp::zero(kg_reg);
+        warp::zero(vg_reg);
+
+        wait(rm_b, 0);
+        typename rt_fl<16, G::tile_h_qo>::col_vec rm_reg_f;
+        kittens::group<kittens::WARPGROUP_WARPS>::load(rm_reg_f, rm_smem);
+
+        wait(kv_b, 0);
+        {
+            auto k_view = k_smem.template subtile<16, G::tile_width>(int2{warp_in_wg, 0});
+            auto v_view = v_smem.template subtile<16, G::tile_width>(int2{warp_in_wg, 0});
+            warp::load(k_warp_bf, k_view);
+            warp::load(v_warp_bf, v_view);
+        }
+
+        const float log2e = 1.44269504089f;
+
+        for (int qo_idx = q_start; qo_idx < qo_blocks; qo_idx++, tic ^= 1, toc ^= 1) {
+            const int phase = ((qo_idx - q_start)/2)%2;
+
+            // 1) s_block_t = K_warp @ Q^T   (16 kv × 64 q)
+            wait(q_b[tic], phase);
+            rt_bf<G::tile_h_qo, G::tile_width, ducks::rt_layout::row> q_reg_row;
+            warp::load(q_reg_row, q_smem[tic]);
+            warp::zero(s_block_t);
+            warp::mma_ABt(s_block_t, k_warp_bf, q_reg_row, s_block_t);
+
+            wait(vec_b[tic], phase);
+            warp::mul(s_block_t, s_block_t, scale);
+
+            wait(pb_b[tic], phase);
+            evo_add_pb_transposed(s_block_t, pb_smem[tic]);
+            warp::add_row(s_block_t, s_block_t, rm_reg_f);
+            evo_stream_sub_tile(s_block_t, l_smem, tic);
+            warp::mul(s_block_t, s_block_t, log2e);
+            warp::exp2(s_block_t, s_block_t);
+            warp::copy(p_block_t,     s_block_t);
+            warp::copy(p_block_t_mma, s_block_t);
+
+            // 2) dp_block_t = V_warp @ dO^T
+            wait(o_b[tic], phase);
+            rt_bf<G::tile_h_qo, G::tile_width, ducks::rt_layout::row> og_reg_row;
+            warp::load(og_reg_row, og_smem[tic]);
+            warp::zero(dp_block_t);
+            warp::mma_ABt(dp_block_t, v_warp_bf, og_reg_row, dp_block_t);
+
+            evo_stream_sub_tile(dp_block_t, d_smem, tic);
+            warp::mul(ds_block_t, p_block_t, dp_block_t);
+
+            evo_atomic_add_dpair_bias(ds_block_t,
+                                       dpb_base_bh,
+                                       qo_idx * G::tile_h_qo,
+                                       kv_block * G::tile_h,
+                                       N);
+
+            warp::mul(ds_block_t, ds_block_t, scale);
+
+            // 3) dV += P^T @ dO
+            rt_bf<G::tile_h_qo, G::tile_width, ducks::rt_layout::col> og_reg_col;
+            warp::load(og_reg_col, og_smem[tic]);
+            warp::mma_AB(vg_reg, p_block_t_mma, og_reg_col, vg_reg);
+
+            warp::copy(ds_block_t_mma, ds_block_t);
+            {
+                auto ds_view = ds_smem.template subtile<16, G::tile_h_qo>(int2{warp_in_wg, 0});
+                warp::store(ds_view, ds_block_t_mma);
+            }
+
+            // 4) dK += dS^T @ Q
+            rt_bf<G::tile_h_qo, G::tile_width, ducks::rt_layout::col> q_reg_col;
+            warp::load(q_reg_col, q_smem[tic]);
+            warp::mma_AB(kg_reg, ds_block_t_mma, q_reg_col, kg_reg);
+
+            // 5) dQ split across the 4 warps
+            kittens::group<kittens::WARPGROUP_WARPS>::sync(10);
+            wait(qg_ready, toc);
+            if (qo_idx > 0) warp::tma::store_async_wait();
+
+            rt_fl<16, G::tile_width> qg_reg_w;
+            {
+                rt_bf<G::tile_h, 16,            ducks::rt_layout::col> ds_slice_col;
+                rt_bf<G::tile_h, G::tile_width, ducks::rt_layout::col> k_full_col;
+                auto ds_q_slice = ds_smem.template subtile<G::tile_h, 16>(int2{0, warp_in_wg});
+                warp::load(ds_slice_col, ds_q_slice);
+                warp::load(k_full_col,   k_smem);
+                warp::zero(qg_reg_w);
+                warp::mma_AtB(qg_reg_w, ds_slice_col, k_full_col, qg_reg_w);
+            }
+            {
+                auto qg_view = qg_smem.template subtile<16, G::tile_width>(int2{warp_in_wg, 0});
+                warp::store(qg_view, qg_reg_w);
+            }
+            kittens::group<kittens::WARPGROUP_WARPS>::sync(10);
+            if (warp_in_wg == 0 && warp::laneid() == 0) arrive(compute_done[tic]);
+        }
+
+        // ----- Final dK / dV writes (each warp stores its 16-row slice via TMA store_add) -----
+        kittens::group<kittens::WARPGROUP_WARPS>::sync(10);
+        {
+            auto kg_view = kg_smem->template subtile<16, G::tile_width>(int2{warp_in_wg, 0});
+            warp::store(kg_view, kg_reg);
+        }
+        kittens::group<kittens::WARPGROUP_WARPS>::sync(10);
+        if (warp_in_wg == 0) {
+            coord<kg_tile> tile_idx = {batch_msa_idx, head_idx, kv_block, 0};
+            warp::tma::store_add_async(g.kg, *kg_smem, tile_idx);
+            warp::tma::store_commit_group();
+        }
+
+        wait(qg_ready, toc);
+        kittens::group<kittens::WARPGROUP_WARPS>::sync(10);
+        {
+            auto vg_view = vg_smem->template subtile<16, G::tile_width>(int2{warp_in_wg, 0});
+            warp::store(vg_view, vg_reg);
+        }
+        kittens::group<kittens::WARPGROUP_WARPS>::sync(10);
+        if (warp_in_wg == 0) {
+            coord<vg_tile> tile_idx = {batch_msa_idx, head_idx, kv_block, 0};
+            warp::tma::store_add_async(g.vg, *vg_smem, tile_idx);
+            warp::tma::store_commit_group();
+        }
+        warp::tma::store_async_wait();
     }
 }
 
@@ -1172,6 +1467,29 @@ evoattention_backward(at::Tensor q,
                   static_cast<int>(seq_len), static_cast<int>(n_seq),
                   static_cast<int>(heads), softmax_scale};
 
+        // Algorithmic selection (tunables in evo_bwd_tile_dims<D>):
+        //   seq_len <= mma_seq_cutoff  → evo_bwd_mma_ker  (mma.sync, CW=1)
+        //   else                         → evo_bwd_ker      (WGMMA,   CW=2)
+        constexpr int MMA_CUTOFF    = evo_bwd_tile_dims<D>::mma_seq_cutoff;
+        constexpr int MMA_BLOCKS_SM = evo_bwd_tile_dims<D>::mma_blocks_sm;
+        if constexpr (D == 64) {
+            if (seq_len <= MMA_CUTOFF) {
+                // mma.sync path: CW=1, 256 threads/CTA, MMA_BLOCKS_SM CTAs/SM.
+                constexpr int MMA_CW = 1;
+                auto mem_size = (kittens::MAX_SHARED_MEMORY / MMA_BLOCKS_SM) - 1024;
+                cudaFuncSetAttribute(evo_bwd_mma_ker<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+                TORCH_CHECK(seq_len % (MMA_CW * KV_H) == 0,
+                            "SEQ_LEN must be divisible by tile_h=", MMA_CW * KV_H,
+                            " for head_dim=", D);
+                dim3 grid_bwd(seq_len / (MMA_CW * KV_H),
+                              static_cast<unsigned>(heads),
+                              static_cast<unsigned>(batch_msa));
+                evo_bwd_mma_ker<D><<<grid_bwd, 32 * 8, mem_size, stream>>>(g);
+                CHECK_CUDA_ERROR(cudaGetLastError());
+                return;
+            }
+        }
+        // WGMMA path (D=128 always, or D=64 with seq_len > MMA_CUTOFF).
         auto mem_size = kittens::MAX_SHARED_MEMORY - 1024;
         cudaFuncSetAttribute(evo_bwd_ker<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
