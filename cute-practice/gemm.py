@@ -34,16 +34,17 @@ def gemm_v3a(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor, ## At t
 
     ## Next, we initialize the memory bars for TMA. ##
     mbar = alloc.allocate_array(cutlass.Int64, num_elems=1)
+    mbar_write = alloc.allocate_array(cutlass.Int64, num_elems=1)
 
     ## Recover base tid. ##
     tid = tidx + tidy * gidx
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
     ## First initialize the memory barrier. ##
     if tid == 0:
         cute.arch.mbarrier_init(mbar, 1)
+        cute.arch.mbarrier_init(mbar_write, 1)
     cute.arch.mbarrier_init_fence()
-    cute.arch.cluster_arrive_relaxed()
-    cute.arch.cluster_wait()
     cute.arch.sync_threads()
 
     ## Now, we prepare the TMA partition.
@@ -69,8 +70,8 @@ def gemm_v3a(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor, ## At t
     ### Next, we get the view for computing the matmul. ##
 
     ## Now we get compA and compB. Cute layouts for smem -> regs for matmul. ##
-    compA = cute.local_tile(leftSmem, (val_lyt_C.shape[0], BLKK), (bidy, 0))
-    compB = cute.local_tile(rightSmem, (BLKK, val_lyt_C.shape[-1]), (0, bidx))
+    compA = cute.local_tile(leftSmem, (val_lyt_C.shape[0], BLKK), (tidy, 0))
+    compB = cute.local_tile(rightSmem, (BLKK, val_lyt_C.shape[-1]), (0, tidx))
 
     ## Finally, we instantiate the register file to store output. ##
     gC_base = cute.composition(answer[None, (bidy, bidx)], tv_lyt_C) # ((64, 32) : (32, 1)) o tv_layout.
@@ -80,35 +81,45 @@ def gemm_v3a(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor, ## At t
     answerRegs.fill(0.0)
 
     phase = 0
-    if tid == 0:
+    if warp_idx == 0:
         cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_left)
         cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_right)
 
     cute.arch.sync_threads()
 
-    for k in range(tAgA.shape[0][-1]):
+    for k in range(tAgA.shape[-1]):
 
-        ## Then we have to load data. ##
-        if tid == 0:
-            cute.arch.mbarrier_arrive_and_expect_tx(mbar, (BLKK * BLKM + BLKK * BLKN) * 2)
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(mbar, (BLKK * BLKM + BLKK * BLKN) * 2)
             cute.copy(tma_atom_left, tAgA[(None, k)], tAsA, tma_bar_ptr=mbar)
             cute.copy(tma_atom_right, tBgB[(None, k)], tBsB, tma_bar_ptr=mbar)
 
-        cute.printf('tid: {}, bidy: {}, bidx: {} A', tid, bidy, bidx)
         ## Then we have to wait on the phase of the mbar to flip. ##
         cute.arch.mbarrier_wait(mbar, phase)
-        cute.printf('tid: {}, bidy: {}, bidx: {} B', tid, bidy, bidx)
+        ## Here's let's go ahead and print out the relevant information. ##
+        if bidx == 1 and bidy == 1 and tid == 0 and k == 0:
+            cute.printf('leftSmem: {}', leftSmem)
+            cute.printf('rightSmem: {}', rightSmem)
 
         ## Finally, we do the gemm here. ##
-        for m_iter in range(val_lyt_C.shape[0]):
-            for n_iter in range(val_lyt_C.shape[1]):
-                for k_iter in range(BLKK):
-                    answerRegs[((n_iter, m_iter),)] += compA[(m_iter, k_iter)].to(cutlass.Float32) * compB[(k_iter, n_iter)].to(cutlass.Float32)
+        ## Only the first 4 warps (tidy 0..7, i.e. tid < 128) participate in
+        ## compute/store. Warp 4 (tidy 8,9) is the TMA-only producer warp; if
+        ## it falls through here, compA[(tidy, 0)] indexes past leftSmem's 8
+        ## M-tiles and gC_base[(tid, None)] wraps around the (16,8) T-mode of
+        ## tv_lyt_C, racing valid threads on the same output positions.
+        if warp_idx < 4:
+            for m_iter in range(val_lyt_C.shape[0]):
+                for n_iter in range(val_lyt_C.shape[1]):
+                    for k_iter in range(BLKK):
+                        answerRegs[((n_iter, m_iter),)] += compA[(m_iter, k_iter)].to(cutlass.Float32) * compB[(k_iter, n_iter)].to(cutlass.Float32)
 
+        cute.arch.sync_threads()  ## For now, we have synchronization over here. ##
         phase ^= 1
 
     ## finally we store to memory. ##
-    gC_base[(tid, None)] = answerRegs.load().to(cutlass.BFloat16)
+    if warp_idx < 4:
+        gC_base[(tid, None)] = answerRegs.load().to(cutlass.BFloat16)
 
 @cute.kernel
 def gemm_v2(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
@@ -374,8 +385,11 @@ if __name__ == '__main__':
     comp_fn(a_, b_, c_)
 
     #truth = torch.mm(a, b)
-    #truth = torch.einsum('ab,bc->ac',a,b)
+    truth = torch.einsum('ab,bc->ac',a,b)
+    print(f'a: {a[64:64+64, :16]}, b: {b[:16, 32:32+32]}')
 
-    #print(f'out: {c}, truth: {truth}')
+    print(f'out: {c}, truth: {truth}')
     print(f'{c}')
-    #print(f'is_corect: {torch.allclose(c, truth, atol=1e-2, rtol=1e-2)}')
+    print(f'is_corect: {torch.allclose(c, truth, atol=1e-2, rtol=1e-2)}')
+    print(f'max-value: {torch.abs(c - truth).argmax()}')
+    print(f'c: {c[8672 // 128, 8672 % 128]}, truth: {truth[8672 // 128, 8672 % 128]}')
