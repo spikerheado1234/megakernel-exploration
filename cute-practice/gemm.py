@@ -1,11 +1,128 @@
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
+from cutlass.utils import hopper_helpers as sm90_utils
+from cutlass.utils.layout import LayoutEnum
+from cutlass.cute.nvgpu.warpgroup import OperandMajorMode, OperandSource
 import torch
 
 #######################################################################
 ##  Multi-part CuTe-DSL kernels building up to TMA + WGMMA usage.
 #######################################################################
+
+@cute.kernel
+def gemm_v3b(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
+                M: cutlass.Int32, N: cutlass.Int32, K: cutlass.Int32,
+                tma_atom_a: cute.CopyAtom, tma_atom_b: cute.CopyAtom, 
+                a_smem_lyt: cute.ComposedLayout, b_smem_lyt: cute.ComposedLayout, # Created from tiled_mma.
+                tiled_mma: cute.TiledMma,
+                BLKM: cutlass.Constexpr, BLKN: cutlass.Constexpr, BLKK: cutlass.Constexpr):
+    """
+    Uses TMA and Tensor-Core via tiled_mma for fast matmul.
+    """
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()
+    gidx, gidy, _ = cute.arch.block_dim()
+    warp_idx = cute.arch.warp_idx()
+
+    ## Compute global tid within CTA. ##
+    tid = tidx 
+
+    alloc = cutlass.utils.SmemAllocator()
+    leftSmem_lyt = cute.make_layout((BLKM, BLKK))
+    rightSmem_lyt = cute.make_layout((BLKK, BLKN))
+
+    print(f'prining composed layout: outer: {a_smem_lyt.outer}, inner: {a_smem_lyt.inner}')
+
+    ## We have to init smem in a TC friendly way. ##
+    leftSmem = alloc.allocate_tensor(cutlass.BFloat16, a_smem_lyt.outer, swizzle=a_smem_lyt.inner)
+    rightSmem = alloc.allocate_tensor(cutlass.BFloat16, b_smem_lyt.outer, swizzle=b_smem_lyt.inner)
+
+    ## Prepare synchronization. ##
+    producer_mbar = alloc.allocate_array(cutlass.Int64, num_elems=1)
+    consumer_mbar = alloc.allocate_array(cutlass.Int64, num_elems=1)
+
+    if tid == 0:
+        cute.arch.mbarrier_init(producer_mbar, 1)
+        cute.arch.mbarrier_init(consumer_mbar, 1)
+
+    cute.arch.sync_threads()
+
+    ## Prepare TMA descriptor and the lot. ##
+
+    ## Step 1: we prepare grouped layouts. ##
+    aSmem_tma = cute.group_modes(leftSmem, 0, 2)
+    bSmem_tma = cute.group_modes(rightSmem, 0, 2)
+    left_lyt = cute.local_tile(left, (BLKM, BLKK), (bidy, None))
+    right_lyt = cute.local_tile(right, (BLKK, BLKN), (None, bidx))
+    print(f'a_smem_lyt: {a_smem_lyt}, b_smem_lyt: {b_smem_lyt}')
+    aGmem_tma = cute.group_modes(left_lyt, 0, 2)
+    bGmem_tma = cute.group_modes(right_lyt, 0, 2)
+
+    print(f'aGmem_tma: {aGmem_tma}, bGmem_tma: {bGmem_tma}')
+
+    ## Step 2: call tma_partition to preapre smem and global memory layouts. ##
+    tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_a, 0, cute.make_layout((1,)), aSmem_tma, aGmem_tma
+            )
+
+    tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_b, 0, cute.make_layout((1,)), bSmem_tma, bGmem_tma 
+            )
+
+    print(f'tAsA: {tAsA.shape}, tAgA: {tAgA[(None, 0)].shape}')
+
+    ## Step 3: fetch TMA descriptor information. ##
+    if warp_idx == 0:
+        cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
+        cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
+
+    ## Prepare WGMMA fragments. ##
+    thr_mma = tiled_mma.get_slice(tid)
+
+    ## We get the left and right slices of smem. ##
+    tCsA = thr_mma.partition_A(leftSmem)
+    tCsB = thr_mma.partition_B(rightSmem)
+
+    tCrA = tiled_mma.make_fragment_A(tCsA)
+    tCrB = tiled_mma.make_fragment_B(tCsB)
+
+    tCgC = cute.local_tile(answer, (BLKM, BLKN), (bidy, bidx))
+    wb_tensor = thr_mma.partition_C(tCgC)
+    tCrC = tiled_mma.make_fragment_C(wb_tensor)
+
+    tCrC.fill(0)
+
+    cute.arch.sync_threads()
+
+    phase_produce: cutlass.Int64 = 0
+    ## Now, we have the full loop to go through. ##
+    for k in range(tAgA.shape[-1]):
+
+        ## First we load via TMA. ##
+        if warp_idx == 0:  ## Only one warp is responsible for copying. ##
+            if tid == 0:
+                cute.arch.mbarrier_arrive_and_expect_tx(producer_mbar, (BLKM * BLKK + BLKN * BLKK) * 2)
+            cute.copy(tma_atom_a, tAgA[(None, k)], tAsA[(None, 0)], tma_bar_ptr=producer_mbar)
+            cute.copy(tma_atom_b, tBgB[(None, k)], tBsB[(None, 0)], tma_bar_ptr=producer_mbar)
+
+        ## Next, we have to wait for the producer to produce the relevant data. ##
+        cute.arch.mbarrier_wait(producer_mbar, phase_produce)
+
+        ## Finally, we can do the relevant GeMM. ##
+        cute.nvgpu.warpgroup.fence()
+        cute.gemm(
+                    tiled_mma,
+                    tCrC, tCrA[None, None, None, 0], tCrB[None, None, None, 0], tCrC, ## Figure out a more general way to find out which k-atom this loop corresponds to rather than baking it in. 
+                )
+        cute.nvgpu.warpgroup.commit_group()
+        cute.nvgpu.warpgroup.wait_group(0)
+
+        ## We flip the phase bit here. ##
+        phase_produce ^= 1
+
+    ## Now the finaly write to memory. ##
+    wb_tensor[None] = tCrC.load().to(cutlass.BFloat16)
 
 @cute.kernel
 def gemm_v3a(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor, ## At this point, what is the layout of left, right and answer?
@@ -367,6 +484,78 @@ def wrapper_gemm_v3a(a_: cute.Tensor, b_: cute.Tensor, c_: cute.Tensor):
                 block=(16, 8 + 2, 1) ## We spawn an extra warp for issuing TMA only.
             )
 
+@cute.jit
+def wrapper_gemm_v3b(a_: cute.Tensor, b_: cute.Tensor, c_: cute.Tensor):
+    ## Now, we have to do a bunch of things here. ##
+
+    ## Now that we're using tiled-mma we launch with: 128 threads. 
+    ##   let's make each of them operate on 4 values. This totals 512 
+    ##   elements that each CTA operates on.
+
+    ## First, these are the block sizes we are interested in. ##
+    BLKM, BLKN, BLKK = 64, 32, 16
+    M, K = a_.shape
+    _, N = b_.shape
+
+    ## First, let's build the tiled_mma operators. ##
+    tiled_mma = sm90_utils.make_trivial_tiled_mma(
+                cutlass.BFloat16,
+                cutlass.BFloat16,
+                OperandMajorMode.K,
+                OperandMajorMode.MN,
+                cutlass.Float32,
+                atom_layout_mnk=(1, 1, 1),
+                tiler_mn=(64, 32),
+                a_source=OperandSource.SMEM
+            )
+
+    print(f'tiled_mma: {tiled_mma}')
+
+    aSmem_lyt = sm90_utils.make_smem_layout_a(
+                LayoutEnum.ROW_MAJOR, (BLKM, BLKN, BLKK),
+                a_dtype=cutlass.BFloat16, num_stages=1
+            )
+
+    bSmem_lyt = sm90_utils.make_smem_layout_b(
+                LayoutEnum.COL_MAJOR, (BLKM, BLKN, BLKK),
+                b_dtype=cutlass.BFloat16, num_stages=1
+            )
+
+    ## Next, we have to make the TMA descriptors. ##
+    op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+    tma_atom_a, a_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                op,
+                a_,
+                aSmem_lyt,
+                (BLKM, BLKK)
+            )
+
+    tma_atom_b, b_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                op,
+                b_,
+                bSmem_lyt,
+                (BLKN, BLKK)
+            )
+
+    print(f'a_tensor: {a_tensor}, b_tensor: {b_tensor}')
+
+    ## Next, we still have to partition the output. ##
+    partitioned_C = cute.zipped_divide(c_, (BLKM, BLKN))  ## Now we don't need to construct tv-layouts and can directly use the tiler.
+
+    ## Lastly, we launch the kernel. ##
+    gemm_v3b(
+            a_tensor, b_tensor, partitioned_C,
+            M, N, K,
+            tma_atom_a, tma_atom_b, 
+            aSmem_lyt, bSmem_lyt,
+            tiled_mma,
+            BLKM, BLKN, BLKK
+            ).launch(
+                    grid=(cute.size(partitioned_C, mode=[1, 1]), cute.size(partitioned_C, mode=[1, 0]), 1),
+                    block=(128, 1, 1)
+                    )
+    
+
 if __name__ == '__main__':
     ## Here we launch some simple test cases. ##
     torch.manual_seed(42)
@@ -380,7 +569,7 @@ if __name__ == '__main__':
     BLK_M, BLK_N, BLK_K = 10, 10, 10
 
     #comp_fn = cute.compile(wrapper_gemm_simple, a_, b_, c_, BLK_M, BLK_N, BLK_K)
-    comp_fn = cute.compile(wrapper_gemm_v3a, a_, b_, c_)
+    comp_fn = cute.compile(wrapper_gemm_v3b, a_, b_, c_)
 
     comp_fn(a_, b_, c_)
 
