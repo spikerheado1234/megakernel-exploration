@@ -32,11 +32,13 @@ def gemm_v3b(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
     leftSmem_lyt = cute.make_layout((BLKM, BLKK))
     rightSmem_lyt = cute.make_layout((BLKK, BLKN))
 
-    print(f'prining composed layout: outer: {a_smem_lyt.outer}, inner: {a_smem_lyt.inner}')
 
     ## We have to init smem in a TC friendly way. ##
     leftSmem = alloc.allocate_tensor(cutlass.BFloat16, a_smem_lyt.outer, swizzle=a_smem_lyt.inner)
     rightSmem = alloc.allocate_tensor(cutlass.BFloat16, b_smem_lyt.outer, swizzle=b_smem_lyt.inner)
+
+    print(f'printing composed layout (leftSmem): outer: {a_smem_lyt.outer}, inner: {a_smem_lyt.inner}')
+    print(f'printing composed layout (rightSmem): outer: {b_smem_lyt.outer}, inner: {b_smem_lyt.inner}')
 
     ## Prepare synchronization. ##
     producer_mbar = alloc.allocate_array(cutlass.Int64, num_elems=1)
@@ -54,7 +56,7 @@ def gemm_v3b(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
     aSmem_tma = cute.group_modes(leftSmem, 0, 2)
     bSmem_tma = cute.group_modes(rightSmem, 0, 2)
     left_lyt = cute.local_tile(left, (BLKM, BLKK), (bidy, None))
-    right_lyt = cute.local_tile(right, (BLKK, BLKN), (None, bidx))
+    right_lyt = cute.local_tile(right, (BLKN, BLKK), (bidx, None))
     print(f'a_smem_lyt: {a_smem_lyt}, b_smem_lyt: {b_smem_lyt}')
     aGmem_tma = cute.group_modes(left_lyt, 0, 2)
     bGmem_tma = cute.group_modes(right_lyt, 0, 2)
@@ -93,9 +95,17 @@ def gemm_v3b(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
 
     tCrC.fill(0)
 
+    ## Let's see what things look like internally. ##
+    print(f'tCrC: {tCrC}, tCsA: {tCsA}')
+
+    ## Here, we also have a staging shmem buffer for printing out things to check correctness at different stages. ##
+    temp_buffer = alloc.allocate_tensor(cutlass.Float32, cute.make_layout((BLKM, BLKN)), swizzle=None)
+    thr_sliced_tBuff = thr_mma.partition_C(temp_buffer)
+
     cute.arch.sync_threads()
 
     phase_produce: cutlass.Int64 = 0
+    tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
     ## Now, we have the full loop to go through. ##
     for k in range(tAgA.shape[-1]):
 
@@ -113,15 +123,26 @@ def gemm_v3b(left: cute.Tensor, right: cute.Tensor, answer: cute.Tensor,
         cute.nvgpu.warpgroup.fence()
         cute.gemm(
                     tiled_mma,
-                    tCrC, tCrA[None, None, None, 0], tCrB[None, None, None, 0], tCrC, ## Figure out a more general way to find out which k-atom this loop corresponds to rather than baking it in. 
+                    tCrC, tCrA[None, None, None, 0], tCrB[None, None, None, 0], tCrC 
                 )
+        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True) ## This is quite awkward phrasing over here. ##
         cute.nvgpu.warpgroup.commit_group()
         cute.nvgpu.warpgroup.wait_group(0)
+
+        ## here we print some stuff for debugging. ##
+        thr_sliced_tBuff[None] = tCrC.load()
+        cute.arch.sync_threads()
+        if bidy == 1 and bidx == 1 and tid == 0 and k == 1:
+            ## Here we print values in smem for debugging use-cases. ##
+            cute.printf('answer smem: {}', temp_buffer)
+
 
         ## We flip the phase bit here. ##
         phase_produce ^= 1
 
     ## Now the finaly write to memory. ##
+    if bidy == 1 and bidx == 1 and tid == 0:
+        cute.printf('final output: {}', tCrC)
     wb_tensor[None] = tCrC.load().to(cutlass.BFloat16)
 
 @cute.kernel
@@ -497,6 +518,10 @@ def wrapper_gemm_v3b(a_: cute.Tensor, b_: cute.Tensor, c_: cute.Tensor):
     M, K = a_.shape
     _, N = b_.shape
 
+    # CUTLASS's canonical B-shape is (N, K). Our b_ arrives as (K, N) row-major (N contiguous).
+    # Build a (N, K) view via cute.select(mode=[1, 0]) — same bytes, swapped axis labels.
+    b_ = cute.make_tensor(b_.iterator, cute.select(b_.layout, mode=[1, 0]))
+
     ## First, let's build the tiled_mma operators. ##
     tiled_mma = sm90_utils.make_trivial_tiled_mma(
                 cutlass.BFloat16,
@@ -521,6 +546,8 @@ def wrapper_gemm_v3b(a_: cute.Tensor, b_: cute.Tensor, c_: cute.Tensor):
                 b_dtype=cutlass.BFloat16, num_stages=1
             )
 
+    print(f'bSmem_lyt: {bSmem_lyt}')
+
     ## Next, we have to make the TMA descriptors. ##
     op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
     tma_atom_a, a_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
@@ -544,9 +571,9 @@ def wrapper_gemm_v3b(a_: cute.Tensor, b_: cute.Tensor, c_: cute.Tensor):
 
     ## Lastly, we launch the kernel. ##
     gemm_v3b(
-            a_tensor, b_tensor, partitioned_C,
+            a_tensor, b_tensor, c_,
             M, N, K,
-            tma_atom_a, tma_atom_b, 
+            tma_atom_a, tma_atom_b,
             aSmem_lyt, bSmem_lyt,
             tiled_mma,
             BLKM, BLKN, BLKK
@@ -555,7 +582,6 @@ def wrapper_gemm_v3b(a_: cute.Tensor, b_: cute.Tensor, c_: cute.Tensor):
                     block=(128, 1, 1)
                     )
     
-
 if __name__ == '__main__':
     ## Here we launch some simple test cases. ##
     torch.manual_seed(42)
@@ -570,15 +596,12 @@ if __name__ == '__main__':
 
     #comp_fn = cute.compile(wrapper_gemm_simple, a_, b_, c_, BLK_M, BLK_N, BLK_K)
     comp_fn = cute.compile(wrapper_gemm_v3b, a_, b_, c_)
+    print(f'a: {a[64:64*2, :16]}, b: {b[:16, 32:32*2]}')
 
     comp_fn(a_, b_, c_)
 
     #truth = torch.mm(a, b)
     truth = torch.einsum('ab,bc->ac',a,b)
-    print(f'a: {a[64:64+64, :16]}, b: {b[:16, 32:32+32]}')
 
     print(f'out: {c}, truth: {truth}')
-    print(f'{c}')
     print(f'is_corect: {torch.allclose(c, truth, atol=1e-2, rtol=1e-2)}')
-    print(f'max-value: {torch.abs(c - truth).argmax()}')
-    print(f'c: {c[8672 // 128, 8672 % 128]}, truth: {truth[8672 // 128, 8672 % 128]}')
