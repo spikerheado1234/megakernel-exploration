@@ -76,6 +76,56 @@ All accepted workloads use S=N:
 The fused implementation never materializes the B x S x H x N x N score
 tensor. It computes 4*B*S*H*N^2*D tensor FLOPs for QK and PV.
 
+## 2.1 Retained tiling configuration
+
+The final forward kernel uses one static tiling configuration for every target
+shape. Here `B` means batch size, whereas `Bc` means the number of key/value
+positions consumed by one main-loop iteration.
+
+| Symbol or setting | Value | Meaning |
+|---|---:|---|
+| `D` | 64 | Head dimension and QK reduction extent |
+| `Br` / consumer `M` | 64 | Query rows owned by one consumer warpgroup |
+| CTA `M` | 128 | Query rows per CTA: two consumers times `Br=64` |
+| `Bc` / score `N` | 64 | Key/value positions processed per loop iteration |
+| QK logical tile | `64 x 64 x 64` | `M x N x K`; SMEM Q times SMEM K, accumulated in FP32 |
+| PV logical tile | `64 x 64 x 64` | `M x D x Bc`; RMEM BF16 P times SMEM BF16 V, accumulated in FP32 |
+| Native WGMMA K step | 16 | Four K steps compose each logical QK or PV tile |
+| Consumer groups | 2 | Two independent 128-thread Hopper warpgroups |
+| Producer warps | 1 | Warp 8 owns TMA producer control flow |
+| Threads per CTA | 288 | Eight consumer warps plus one producer warp |
+| K/V pipeline stages | 2 | Ping-pong SMEM ring indexed by `key_block % 2` |
+| Q shared slots | 2 | One persistent `64 x 64` BF16 tile per consumer |
+| Pair-bias shared slots | 2 | One private `64 x 64` FP32 tile per consumer |
+| Residual-mask storage | `64 x 2` FP32 | One physical `Bc` vector per K/V stage |
+| Residual-mask logical view | `64 x 64 x 2` | `[Br,Bc,stage]` with zero stride in `Br` |
+| Output SMEM tile | `128 x 64` BF16 | Both consumer results combined before one TMA store |
+| Cluster shape | `1 x 1 x 1` | No multicast in the retained universal kernel |
+| Launch occupancy target | 2 CTAs/SM | Requested with `min_blocks_per_mp=2` |
+
+The main loop has `N / Bc = N / 64` iterations. One CTA computes the output
+tile
+
+```text
+O[problem, query_block * 128 : (query_block + 1) * 128, 0 : 64]
+```
+
+where `problem = (batch, sequence, head)` is flattened to
+`P = B * S * H`. Because the accepted workload has `S=N`, the launch grid is
+
+```python
+problem_count = B * N * H
+query_blocks = N // CTA_QUERY_TILE_SIZE       # CTA_QUERY_TILE_SIZE = 128
+grid = (problem_count * query_blocks, 1, 1)
+block = (288, 1, 1)
+```
+
+The shared-memory layouts are row-major/swizzled Q and K, column-major/swizzled
+V, MN_SW128 FP32 pair bias, and MN_SW128 BF16 output. Pair bias is streamed once
+per consumer and key block with an evict-last L2 hint. Q is resident for the
+entire key loop; K, V, and the physical residual-mask vector advance through
+the two-stage ring.
+
 ## 3. Initial roofline diagnosis
 
 The initial model used these H100 rates:
