@@ -144,7 +144,7 @@ def _evoattention_forward_kernel(
         cute.make_layout((KEY_TILE_SIZE, KEY_VALUE_STAGES), stride=(1, KEY_TILE_SIZE)),
         swizzle=None,
     )
-    # Residue mask is physically one [Bc] vector per stage.  This zero-stride
+    # Residual mask is physically one [Bc] vector per stage. This zero-stride
     # M mode represents the logical [Mq,Bc] broadcast without replication.
     shared_broadcast_mask = cute.make_tensor(
         shared_mask.iterator,
@@ -250,8 +250,9 @@ def _evoattention_forward_kernel(
     if warp_idx == PRODUCER_WARP_INDEX:
         warpgroup_thread_idx = thread_idx - CONSUMER_THREAD_COUNT
 
-        # The single producer warp issues TMA.  All lanes execute the copy;
-        # only its elected lane programs the expected transaction size.
+        # One warp owns producer control flow. The CuTe TMA copy atom has a
+        # one-thread logical copy layout, so this warp-uniform call does not
+        # create 32 independent transfers. Lane 0 also programs expected bytes.
         if warpgroup_thread_idx == 0:
             cute.arch.mbarrier_arrive_and_expect_tx(
                 query_ready, QUERY_TILE_SIZE * HEAD_DIMENSION * 2

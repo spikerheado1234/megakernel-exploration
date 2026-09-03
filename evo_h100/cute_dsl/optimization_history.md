@@ -33,7 +33,7 @@ absolute output error was 0.0078125 and the maximum FP32 LSE error was
 1.90735e-6.
 
 The behavior-preserving cleaned kernel is SHA-256
-19d404a7f778bf4dca42918530116df55fe6f1d5f2e86b2f23f075b4a71c55dd.
+49b5757b788acb742b261d59228098596ab177cd01ef0be98fa87e9b40aebd7a.
 
 The original fixed-buffer acceptance benchmark reached 2x or better on 30 of
 32 shapes before the final N=128 changes. The retained short path subsequently
@@ -131,25 +131,115 @@ With N=128 there are only two K/V blocks, so there is no useful steady state.
 The final short path skips those named-barrier operations and the K/V-free
 barriers whose stages are never reused.
 
+The retained diagonal hand-off is implemented around, rather than inside, the
+QK and PV WGMMA operations:
+
+```python
+if n_ctx != SHORT_SEQUENCE_LENGTH and consumer_warpgroup == 1 and key_block == 0:
+    # Hold WG1's first QK until WG0 has issued QK(0).
+    qk0_to_qk1.arrive_and_wait()
+
+score_mma.set(Field.ACCUMULATE, False)
+cute.nvgpu.warpgroup.fence()
+cute.gemm(score_mma, score_fragment, query_fragment, key_fragment, score_fragment)
+cute.nvgpu.warpgroup.commit_group()
+cute.nvgpu.warpgroup.wait_group(0)
+
+if n_ctx != SHORT_SEQUENCE_LENGTH:
+    if consumer_warpgroup == 0:
+        qk0_to_qk1.arrive()            # release WG1 QK(k)
+    else:
+        qk1_to_pv0.arrive()            # release WG0 PV(k)
+
+run_online_softmax_in_registers(score_fragment)
+
+if n_ctx != SHORT_SEQUENCE_LENGTH:
+    if consumer_warpgroup == 0:
+        qk1_to_pv0.arrive_and_wait()   # wait for WG1 QK(k)
+    elif key_block + 1 < num_key_blocks:
+        qk0_to_qk1.arrive_and_wait()   # wait for WG0 QK(k+1)
+
+output_mma.set(Field.ACCUMULATE, True)
+cute.nvgpu.warpgroup.fence()
+cute.gemm(output_mma, output_accumulator, probability_fragment,
+          value_fragment, output_accumulator)
+cute.nvgpu.warpgroup.commit_group()
+cute.nvgpu.warpgroup.wait_group(0)
+```
+
+The two helper-like calls in this explanatory excerpt expand to the score
+update in section 4.4; the retained source keeps that work inline.
+
 ### 4.1 Logical mask broadcast
 
 Only 64 FP32 mask values are physically stored per K/V stage. A zero-stride
-query mode exposes the logical 64x64 broadcast:
+query mode exposes the logical 64x64 broadcast. The complete path is:
 
-    shared_broadcast_mask = cute.make_tensor(
-        shared_mask.iterator,
-        cute.make_layout(
-            (QUERY_TILE_SIZE, KEY_TILE_SIZE, KEY_VALUE_STAGES),
-            stride=(0, 1, KEY_TILE_SIZE),
-        ),
-    )
+```python
+# Physical storage: [K=64, stage=2], or 512 bytes total.
+shared_mask = allocator.allocate_tensor(
+    cutlass.Float32,
+    cute.make_layout(
+        (KEY_TILE_SIZE, KEY_VALUE_STAGES),
+        stride=(1, KEY_TILE_SIZE),
+    ),
+    swizzle=None,
+)
 
-Two score rows sharing a WGMMA quartet load each mask column once:
+# Logical consumer view: [M=64, K=64, stage=2]. The M stride is zero,
+# so all 64 query rows alias the same physical 64-element mask vector.
+shared_broadcast_mask = cute.make_tensor(
+    shared_mask.iterator,
+    cute.make_layout(
+        (QUERY_TILE_SIZE, KEY_TILE_SIZE, KEY_VALUE_STAGES),
+        stride=(0, 1, KEY_TILE_SIZE),
+    ),
+)
 
-    mask_0 = shared_broadcast_mask[0, column_0, stage]
-    mask_1 = shared_broadcast_mask[0, column_1, stage]
-    score_0 = qk_0 * SOFTMAX_SCALE + bias_0 + mask_0
-    score_2 = qk_2 * SOFTMAX_SCALE + bias_2 + mask_0
+# The producer transfers one [K=64] FP32 vector, not an [M,K] matrix.
+mask_tiles = cute.zipped_divide(residual_mask_tensor, (KEY_TILE_SIZE,))
+mask_problem = mask_tiles[None, (None, batch_seq_idx)]
+shared_mask_part, global_mask_part = cute.nvgpu.cpasync.tma_partition(
+    residual_mask_tma,
+    0,
+    cute.make_layout(1),
+    shared_mask,
+    mask_problem,
+)
+cute.copy(
+    residual_mask_tma,
+    global_mask_part[None, key_block],
+    shared_mask_part[None, stage],
+    tma_bar_ptr=key_value_ready + stage,
+)
+
+# In the score pass, e and e+2 are two query rows at one key column.
+# Load each broadcast value once and reuse it for both rows.
+_, column_0 = score_coords[elem_0]
+_, column_1 = score_coords[elem_1]
+mask_0 = shared_broadcast_mask[0, column_0, stage]
+mask_1 = shared_broadcast_mask[0, column_1, stage]
+score_fragment[elem_0] = (
+    score_fragment[elem_0] * SOFTMAX_SCALE
+    + pair_bias_fragment[elem_0]
+    + mask_0
+)
+score_fragment[elem_1] = (
+    score_fragment[elem_1] * SOFTMAX_SCALE
+    + pair_bias_fragment[elem_1]
+    + mask_1
+)
+score_fragment[elem_2] = (
+    score_fragment[elem_2] * SOFTMAX_SCALE
+    + pair_bias_fragment[elem_2]
+    + mask_0
+)
+score_fragment[elem_3] = (
+    score_fragment[elem_3] * SOFTMAX_SCALE
+    + pair_bias_fragment[elem_3]
+    + mask_1
+)
+```
 
 This saves 63/64 of the shared-memory capacity that a materialized MxK mask
 would require and avoids redundant shared loads.
@@ -162,15 +252,47 @@ traffic reduction on the complete shape set.
 
 ### 4.2 Split query completion barriers
 
-Each consumer has its own Q completion barrier:
+Each consumer has its own Q completion barrier. The producer independently
+publishes the two 64x64 BF16 transfers, and each consumer waits only for its
+own tile:
 
-    query_ready = allocator.allocate_array(
-        cutlass.Int64, CONSUMER_WARPGROUP_COUNT
+```python
+QUERY_BYTES = QUERY_TILE_SIZE * HEAD_DIMENSION * 2
+
+query_ready = allocator.allocate_array(
+    cutlass.Int64, CONSUMER_WARPGROUP_COUNT
+)
+if thread_idx == 0:
+    for consumer in cutlass.range_constexpr(CONSUMER_WARPGROUP_COUNT):
+        cute.arch.mbarrier_init(query_ready + consumer, 1)
+cute.arch.mbarrier_init_fence()
+cute.arch.sync_threads()
+
+# Warp 8 owns producer control flow. The TMA copy atom has a one-thread
+# logical copy layout; lane 0 owns the transaction-byte accounting.
+if warp_idx == PRODUCER_WARP_INDEX:
+    producer_lane = thread_idx - CONSUMER_THREAD_COUNT
+    if producer_lane == 0:
+        cute.arch.mbarrier_arrive_and_expect_tx(query_ready, QUERY_BYTES)
+        cute.arch.mbarrier_arrive_and_expect_tx(query_ready + 1, QUERY_BYTES)
+
+    cute.copy(
+        query_tma,
+        global_query_partition[None, query_block * 2],
+        shared_query_partition[None, 0],
+        tma_bar_ptr=query_ready,
     )
-    cute.arch.mbarrier_arrive_and_expect_tx(
-        query_ready + consumer, QUERY_TILE_SIZE * HEAD_DIMENSION * 2
+    cute.copy(
+        query_tma,
+        global_query_partition[None, query_block * 2 + 1],
+        shared_query_partition[None, 1],
+        tma_bar_ptr=query_ready + 1,
     )
-    cute.arch.mbarrier_wait(query_ready + consumer_warpgroup, 0)
+else:
+    consumer = thread_idx // THREADS_PER_WARPGROUP
+    cute.arch.mbarrier_wait(query_ready + consumer, 0)
+    # This warpgroup can now form its Q fragment and begin QK.
+```
 
 The earlier implementation used one barrier covering both Q transfers. That
 forced consumer 0 to wait for consumer 1's independent tile. Splitting the
@@ -179,21 +301,53 @@ barrier improved the two difficult N=128 cases by about 1.05-1.07%.
 ### 4.3 Register-sourced PV
 
 The probability tile remains in the QK accumulator registers, is converted to
-BF16, and feeds PV as an RMEM A operand:
+BF16, and feeds PV as an RMEM A operand. No probability tile is allocated in
+shared memory:
 
-    probability_fragment = output_mma.make_fragment_A(
-        output_mma.partition_shape_A((QUERY_TILE_SIZE, KEY_TILE_SIZE))
-    )
-    probability_fragment.store(
-        score_fragment.load().to(cutlass.BFloat16)
-    )
-    cute.gemm(
-        output_mma,
-        output_accumulator,
-        probability_fragment,
-        value_fragment[None, None, None, stage],
-        output_accumulator,
-    )
+```python
+output_mma = sm90_utils.make_trivial_tiled_mma(
+    cutlass.BFloat16,
+    cutlass.BFloat16,
+    OperandMajorMode.K,
+    OperandMajorMode.MN,
+    cutlass.Float32,
+    atom_layout_mnk=(1, 1, 1),
+    tiler_mn=(QUERY_TILE_SIZE, HEAD_DIMENSION),
+    a_source=OperandSource.RMEM,       # P comes from registers
+)
+
+pv_thread = output_mma.get_slice(warpgroup_thread_idx)
+probability_fragment = output_mma.make_fragment_A(
+    output_mma.partition_shape_A((QUERY_TILE_SIZE, KEY_TILE_SIZE))
+)
+value_fragment = output_mma.make_fragment_B(
+    pv_thread.partition_B(shared_value)
+)
+output_accumulator = output_mma.make_fragment_C(
+    output_mma.partition_shape_C((QUERY_TILE_SIZE, HEAD_DIMENSION))
+)
+output_accumulator.fill(0.0)
+
+# score_fragment now contains exp(score - row_max). Convert the register
+# fragment to BF16 in place for the RMEM WGMMA A operand.
+probability_fragment.store(score_fragment.load().to(cutlass.BFloat16))
+
+# Rescale the previous online-softmax output before adding P @ V.
+for elem in cutlass.range_constexpr(cute.size(output_accumulator)):
+    output_accumulator[elem] *= alpha_0 if elem % 4 < 2 else alpha_1
+
+output_mma.set(Field.ACCUMULATE, True)
+cute.nvgpu.warpgroup.fence()
+cute.gemm(
+    output_mma,
+    output_accumulator,
+    probability_fragment,
+    value_fragment[None, None, None, stage],
+    output_accumulator,
+)
+cute.nvgpu.warpgroup.commit_group()
+cute.nvgpu.warpgroup.wait_group(0)
+```
 
 This removed a large probability shared-memory round trip. At B=1, H=4,
 N=384 the NCU duration fell from 729.5 us in the prior shared-heavy kernel to
@@ -209,24 +363,108 @@ each quartet evaluates the online-rescale exponential and reciprocal; the
 result is broadcast with shuffle_sync.
 
 This avoids four identical transcendental operations for each logical row
-without changing the online-softmax recurrence:
+without changing the online-softmax recurrence. The actual quartet reduction
+and leader-broadcast pattern is:
 
-    new_max = max(running_max, local_max)
-    alpha = exp(running_max - new_max)
-    running_sum = running_sum * alpha + local_sum
-    output_accumulator = output_accumulator * alpha + probability @ value
+```python
+# Each thread owns fragments for two rows. Four adjacent lanes collectively
+# cover a row's 64 columns, so XOR shuffles by 1 and 2 finish each reduction.
+local_max_0 = cutlass.max(
+    local_max_0, cute.arch.shuffle_sync_bfly(local_max_0, offset=1)
+)
+local_max_0 = cutlass.max(
+    local_max_0, cute.arch.shuffle_sync_bfly(local_max_0, offset=2)
+)
+local_max_1 = cutlass.max(
+    local_max_1, cute.arch.shuffle_sync_bfly(local_max_1, offset=1)
+)
+local_max_1 = cutlass.max(
+    local_max_1, cute.arch.shuffle_sync_bfly(local_max_1, offset=2)
+)
+
+new_max_0 = cutlass.max(running_max_0, local_max_0)
+new_max_1 = cutlass.max(running_max_1, local_max_1)
+alpha_0 = cutlass.Float32(0.0)
+alpha_1 = cutlass.Float32(0.0)
+if warpgroup_thread_idx % 4 == 0:
+    alpha_0 = cute.math.exp(running_max_0 - new_max_0, fastmath=True)
+    alpha_1 = cute.math.exp(running_max_1 - new_max_1, fastmath=True)
+
+# Broadcast lane 0 within each aligned four-lane subgroup. 0x1C03 is the
+# width-four shuffle mask/clamp used by the retained kernel.
+alpha_0 = cute.arch.shuffle_sync(alpha_0, 0, mask_and_clamp=0x1C03)
+alpha_1 = cute.arch.shuffle_sync(alpha_1, 0, mask_and_clamp=0x1C03)
+
+local_sum_0 = cutlass.Float32(0.0)
+local_sum_1 = cutlass.Float32(0.0)
+for elem in cutlass.range_constexpr(cute.size(score_fragment)):
+    probability = cutlass.Float32(0.0)
+    if elem % 4 < 2:
+        probability = cute.math.exp(
+            score_fragment[elem] - new_max_0, fastmath=True
+        )
+        local_sum_0 += probability
+    else:
+        probability = cute.math.exp(
+            score_fragment[elem] - new_max_1, fastmath=True
+        )
+        local_sum_1 += probability
+    score_fragment[elem] = probability
+
+local_sum_0 += cute.arch.shuffle_sync_bfly(local_sum_0, offset=1)
+local_sum_0 += cute.arch.shuffle_sync_bfly(local_sum_0, offset=2)
+local_sum_1 += cute.arch.shuffle_sync_bfly(local_sum_1, offset=1)
+local_sum_1 += cute.arch.shuffle_sync_bfly(local_sum_1, offset=2)
+running_sum_0 = running_sum_0 * alpha_0 + local_sum_0
+running_sum_1 = running_sum_1 * alpha_1 + local_sum_1
+running_max_0, running_max_1 = new_max_0, new_max_1
+```
 
 ### 4.5 Output epilogue
 
 Each consumer converts its FP32 m64n64 accumulator and stores it into one half
 of a combined MN_SW128 128x64 BF16 shared tile using StMatrix:
 
-    output_bf16 = cute.make_fragment_like(
-        output_accumulator, cutlass.BFloat16
+```python
+# Build the combined CTA tile once. Each consumer takes one [64,64] M slice.
+shared_output_mn = cute.make_tensor(
+    shared_output.iterator,
+    cute.select(shared_output.layout, mode=[1, 0]),
+)
+shared_output_consumer = cute.local_tile(
+    shared_output_mn,
+    (QUERY_TILE_SIZE, HEAD_DIMENSION),
+    (consumer_warpgroup, 0),
+)
+thread_copy_c = output_register_copy.get_slice(warpgroup_thread_idx)
+output_partition = thread_copy_c.partition_D(shared_output_consumer)
+
+# Normalize FP32 O, narrow to BF16, and use four StMatrix operations per CTA.
+for elem in cutlass.range_constexpr(cute.size(output_accumulator)):
+    output_accumulator[elem] *= inv_sum_0 if elem % 4 < 2 else inv_sum_1
+output_bf16 = cute.make_fragment_like(output_accumulator, cutlass.BFloat16)
+output_bf16.store(output_accumulator.load().to(cutlass.BFloat16))
+output_retile = output_register_copy.retile(output_bf16)
+cute.copy(output_register_copy, output_retile, output_partition)
+
+# Make the synchronous StMatrix writes visible to the asynchronous TMA proxy,
+# then wait until both 128-thread consumers have populated the combined tile.
+cute.arch.fence_proxy("async.shared", space="cta")
+cute.arch.barrier(
+    barrier_id=OUTPUT_READY_BARRIER_ID,
+    number_of_threads=CONSUMER_THREAD_COUNT,
+)
+
+# Consumer WG0's first warp owns the one [128,64] TMA store operation.
+if consumer_warpgroup == 0 and warpgroup_thread_idx < 32:
+    cute.copy(
+        output_tma,
+        shared_output_partition,
+        global_output_partition[None, query_block],
     )
-    output_bf16.store(output_accumulator.load().to(cutlass.BFloat16))
-    output_retile = output_register_copy.retile(output_bf16)
-    cute.copy(output_register_copy, output_retile, output_partition)
+    cute.arch.cp_async_bulk_commit_group()
+    cute.arch.cp_async_bulk_wait_group(0)
+```
 
 After one 256-thread barrier, consumer 0 issues one TMA S2G operation for the
 whole tile. The isolated epilogue emitted four STMATRIX instructions, one
@@ -237,18 +475,66 @@ median was 3.3838 us on GPU2 and 3.0985 us on GPU3.
 
 The public wrapper flattens the prepared tensors without copying and marks
 B*S*H and N dimensions dynamic. Tiled dimensions carry divisibility 64. The
-compiled callable is cached under a lock and rejects cross-device reuse:
+compiled callable is cached under a lock and rejects cross-device reuse. The
+relevant host path is:
 
+```python
+def _make_runtime_views(q, k, v, pair_bias, residual_mask, out, lse):
+    batch, sequence_count, heads, n_ctx, dim = q.shape
+    problems = batch * sequence_count * heads
+    return (
+        q.view(problems, n_ctx, dim),
+        k.view(problems, n_ctx, dim),
+        v.view(problems, n_ctx, dim),
+        pair_bias.view(batch * heads, n_ctx, n_ctx),
+        residual_mask.view(batch * sequence_count, n_ctx),
+        out.view(problems, n_ctx, dim),
+        lse.view(problems, n_ctx),
+    )
+
+def _as_dynamic_tensor(tensor, modes, *, alignment, tiled_modes=()):
     dynamic_tensor = from_dlpack(
         tensor.detach(),
-        assumed_align=16,
+        assumed_align=alignment,
         enable_tvm_ffi=True,
     )
-    dynamic_tensor = dynamic_tensor.mark_compact_shape_dynamic(
-        mode=mode,
-        stride_order=tensor.dim_order(),
-        divisibility=64,
+    for mode in modes:
+        dynamic_tensor = dynamic_tensor.mark_compact_shape_dynamic(
+            mode=mode,
+            stride_order=tensor.dim_order(),
+            divisibility=QUERY_TILE_SIZE if mode in tiled_modes else 1,
+        )
+    return dynamic_tensor
+
+def _make_compile_arguments(views, stream):
+    q, k, v, pair_bias, residual_mask, out, lse = views
+    return (
+        _as_dynamic_tensor(q, (0, 1), alignment=16, tiled_modes=(1,)),
+        _as_dynamic_tensor(k, (0, 1), alignment=16, tiled_modes=(1,)),
+        _as_dynamic_tensor(v, (0, 1), alignment=16, tiled_modes=(1,)),
+        _as_dynamic_tensor(
+            pair_bias, (0, 1, 2), alignment=16, tiled_modes=(1, 2)
+        ),
+        _as_dynamic_tensor(
+            residual_mask, (0, 1), alignment=16, tiled_modes=(1,)
+        ),
+        _as_dynamic_tensor(out, (0, 1), alignment=16, tiled_modes=(1,)),
+        _as_dynamic_tensor(lse, (0, 1), alignment=16, tiled_modes=(1,)),
+        stream,
     )
+
+# The first call compiles. Every later target shape reuses this callable.
+if self._compiled is None:
+    with self._lock:
+        if self._compiled is None:
+            compile_args = self._make_compile_arguments(views, cuda_stream)
+            self._compiled = CompileCallable(
+                (PtxasOptions("--maxrregcount=255"), EnableTVMFFI)
+            )(_build_and_launch_forward, *compile_args)
+            self._device_index = device_index
+            self._compile_count += 1
+self._compiled(*views, cuda_stream)
+```
 
 All 32 target shapes execute through one compiled specialization.
 
@@ -325,10 +611,114 @@ raised that to 22/32, but N=128/256 and the largest H=16 cases remained weak.
 Bc=128 was rejected as the universal tile because its one-CTA residency and
 register footprint were worse than the final Bc=64 two-resident-CTA design.
 
-### 5.7 Bc=64, 288 threads, and two CTAs per SM
+### 5.7 Bc=64, one producer warp, and two CTAs per SM
 
 The decisive configuration aligned the consumers to warps 0-7 and assigned
-only warp 8 to TMA production. With Bc=64, two K/V stages, and
+only warp 8 to TMA production. This is legal on Hopper because TMA issue and
+WGMMA execution have different participation requirements:
+
+- `wgmma.mma_async` is a 128-thread warpgroup operation. Consequently, each
+  consumer is exactly four aligned warps: warps 0-3 and warps 4-7.
+- `cp.async.bulk.tensor` is initiated by one thread and the TMA engine performs
+  the asynchronous transfer. Software may dedicate a warp to owning that
+  producer path; TMA does not require the other three warps of a warpgroup.
+- The CuTe TMA atom here uses one logical TMA-copy participant. The source
+  keeps the owning warp in uniform control flow, while lane 0 performs the
+  explicit `mbarrier.arrive.expect_tx` bookkeeping. Those 32 lanes do not mean
+  32 independent copies of the tile.
+- A full producer warpgroup is common in Hopper CUTLASS and FlashAttention-3,
+  in part because role partitioning and dynamic register redistribution are
+  naturally warpgroup-scoped. This kernel does not use warpgroup register
+  reallocation, so those extra 96 producer threads would provide no required
+  WGMMA participation. With the retained uniform 96-register allocation, they
+  would also prevent the two-CTA residency target.
+
+| Operation | Hopper SM90 | Blackwell SM100 |
+|---|---|---|
+| TMA G2S/S2G issue | One issuing thread; a producer warp commonly owns control flow | One issuing thread; a producer warp commonly owns control flow |
+| Tensor-core MMA issue | Four-warp, 128-thread WGMMA collective | Single-thread `tcgen05.mma` issue |
+| Accumulator location | Per-thread registers across the warpgroup | CTA-visible TMEM |
+
+The role split and the complete K/V/mask ring protocol are:
+
+```python
+CONSUMER_WARPGROUP_COUNT = 2
+THREADS_PER_WARPGROUP = 128
+CONSUMER_THREAD_COUNT = 256
+PRODUCER_WARP_INDEX = 8
+THREADS_PER_BLOCK = 288
+KEY_VALUE_STAGES = 2
+
+thread_idx, _, _ = cute.arch.thread_idx()
+warp_idx = cute.arch.warp_idx()
+
+if warp_idx == PRODUCER_WARP_INDEX:
+    producer_lane = thread_idx - CONSUMER_THREAD_COUNT
+    key_block = cutlass.Int32(0)
+    for _ in cutlass.range(num_key_blocks):
+        stage = key_block % KEY_VALUE_STAGES
+
+        # Do not overwrite stage s until both consumer warpgroups have
+        # finished the prior tile held in s.
+        if key_block >= KEY_VALUE_STAGES:
+            free_phase = ((key_block // KEY_VALUE_STAGES) - 1) % 2
+            cute.arch.mbarrier_wait(key_value_free + stage, free_phase)
+
+        # One ready barrier covers K, V, and the physical 64-element mask.
+        if producer_lane == 0:
+            transaction_bytes = (
+                KEY_TILE_SIZE * HEAD_DIMENSION * 2       # K BF16
+                + KEY_TILE_SIZE * HEAD_DIMENSION * 2     # V BF16
+                + KEY_TILE_SIZE * 4                      # mask FP32
+            )
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                key_value_ready + stage, transaction_bytes
+            )
+
+        cute.copy(
+            key_tma,
+            global_key_partition[None, key_block],
+            shared_key_partition[None, stage],
+            tma_bar_ptr=key_value_ready + stage,
+        )
+        cute.copy(
+            value_tma,
+            global_value_partition[None, key_block],
+            shared_value_partition[None, stage],
+            tma_bar_ptr=key_value_ready + stage,
+        )
+        cute.copy(
+            residual_mask_tma,
+            global_mask_partition[None, key_block],
+            shared_mask_partition[None, stage],
+            tma_bar_ptr=key_value_ready + stage,
+        )
+        key_block += 1
+else:
+    consumer = thread_idx // THREADS_PER_WARPGROUP
+    consumer_lane = thread_idx - consumer * THREADS_PER_WARPGROUP
+    key_block = cutlass.Int32(0)
+    for _ in cutlass.range(num_key_blocks):
+        stage = key_block % KEY_VALUE_STAGES
+        full_phase = (key_block // KEY_VALUE_STAGES) % 2
+
+        cute.arch.mbarrier_wait(key_value_ready + stage, full_phase)
+        # All 128 threads in this consumer participate in QK and PV WGMMA;
+        # sections 4.3 and 4.4 show the inlined math and fragment handling.
+        run_qk_softmax_pv(consumer, consumer_lane, stage)
+
+        # Each consumer contributes one arrival; count=2 releases the stage.
+        if n_ctx != SHORT_SEQUENCE_LENGTH and consumer_lane == 0:
+            cute.arch.mbarrier_arrive(key_value_free + stage)
+        key_block += 1
+```
+
+This is not a Blackwell-only relaxation. Blackwell changes the MMA side:
+`tcgen05.mma` is single-thread-issued and accumulates in TMEM, whereas Hopper
+WGMMA is warpgroup-wide and accumulates in registers. TMA itself is
+single-thread-initiated on both architectures.
+
+With Bc=64, two K/V stages, and
 min_blocks_per_mp=2, the compiled kernel used:
 
 | Resource | Value |
@@ -454,15 +844,58 @@ The best path was MN_SW128 with order (1,0):
 | MN_SW128 | (1,0) | 4 | 32 | 5.120 us |
 
 The physical TMA view is [K,Q,problem]. Consumers expose an inverse [Q,K]
-logical view to partition_C:
+logical view to `partition_C`. The full descriptor-to-fragment path is:
 
-    shared_pair_bias_row_col = cute.make_tensor(
-        shared_pair_bias.iterator,
-        cute.select(shared_pair_bias.layout, mode=[1, 0, 2]),
-    )
-    pair_bias_partition = score_thread.partition_C(
-        shared_pair_bias_row_col[None, None, consumer_warpgroup]
-    )
+```python
+pair_bias_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+    SmemLayoutAtomKind.MN_SW128, cutlass.Float32
+)
+pair_bias_layout = cute.tile_to_shape(
+    pair_bias_layout_atom,
+    (KEY_TILE_SIZE, QUERY_TILE_SIZE, CONSUMER_WARPGROUP_COUNT),
+    order=(1, 0, 2),
+)
+pair_bias_tma_layout = cute.tile_to_shape(
+    pair_bias_layout_atom,
+    (KEY_TILE_SIZE, QUERY_TILE_SIZE, 1),
+    order=(1, 0, 2),
+)
+
+# Global [problem,Q,K] is viewed as [K,Q,problem] for the descriptor.
+pair_bias_view = cute.make_tensor(
+    pair_bias.iterator,
+    cute.select(pair_bias.layout, mode=[2, 1, 0]),
+)
+pair_bias_tma, pair_bias_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
+    cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
+    pair_bias_view,
+    pair_bias_tma_layout,
+    (KEY_TILE_SIZE, QUERY_TILE_SIZE),
+)
+
+# Each consumer owns one private slot: [K,Q,consumer].
+shared_pair_bias_row_col = cute.make_tensor(
+    shared_pair_bias.iterator,
+    cute.select(shared_pair_bias.layout, mode=[1, 0, 2]),
+)
+pair_bias_partition = qk_thread.partition_C(
+    shared_pair_bias_row_col[None, None, consumer_warpgroup]
+)
+
+# Load directly into the consumer's stage, then copy the identically
+# partitioned [Q,K] values into its score-shaped register fragment.
+cute.copy(
+    pair_bias_tma,
+    global_pair_bias_partition[
+        None, key_block, query_block * 2 + consumer_warpgroup
+    ],
+    shared_pair_bias_partition[None, consumer_warpgroup],
+    tma_bar_ptr=pair_bias_ready + consumer_warpgroup,
+    cache_policy=cutlass.Int64(PAIR_BIAS_EVICT_LAST_POLICY),
+)
+cute.arch.mbarrier_wait(pair_bias_ready + consumer_warpgroup, pair_bias_phase)
+pair_bias_fragment.store(pair_bias_partition.load())
+```
 
 This is an example where the CuTe layout, TMA descriptor, and consumer
 partition must be designed together. A swizzle enum alone is not sufficient.
@@ -588,9 +1021,12 @@ The implementation choices are consistent with these KernelWiki pages:
 
 - kernel-flash-attention-4, wiki/kernels/flash-attention-4.md
 - hw-tma, wiki/hardware/tma.md
+- hw-mbarrier, wiki/hardware/mbarrier.md
+- technique-warp-specialization, wiki/techniques/warp-specialization.md
 - lang-cute-dsl, wiki/languages/cute-dsl.md
 
-Those pages support the general use of TMA, warp specialization, layout-aware
+These are source-reported references. They support the TMA issue model,
+Hopper WGMMA participation granularity, warp specialization, layout-aware
 swizzling, and ping-pong scheduling. All EvoAttention performance and
 correctness claims in this document come from measurements in this repository,
 not from the external references.
