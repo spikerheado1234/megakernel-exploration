@@ -139,7 +139,8 @@ The initial model used these H100 rates:
 | MUFU exponential | 3.71 T results/s |
 | BF16 tensor cores | 990 TFLOP/s |
 
-With M=64, Bc=64, and no multicast, the predicted B=1, H=4 lower bounds were:
+With one 64-row consumer (`Mq=R=64`), `Bc=64`, and no multicast, the predicted
+B=1, H=4 lower bounds were:
 
 | N | DRAM | L2 to SMEM | SMEM to RF | MUFU | CUDA | tensor |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -808,6 +809,144 @@ Focused measurements:
 The gain is real but small enough that clock state and benchmark cache policy
 can move the ratio across 2x.
 
+### 5.9 Final optimized-schedule roofline
+
+For direct comparison, this is the initial analytical table from section 3.
+It models one 64-row consumer, so the CTA-level K/V reuse width is `R=64`:
+
+| N | DRAM | L2 to SMEM | SMEM to RF | MUFU | CUDA | tensor |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 10.2 us | 12.1 us | 1.4 us | 2.3 us | 2.8 us | 2.2 us |
+| 384 | 91.7 us | 282.8 us | 33.2 us | 62.0 us | 76.3 us | 58.6 us |
+| 1024 | 652.3 us | 5102.7 us | 599.5 us | 1175.8 us | 1446.1 us | 1110.6 us |
+
+The retained schedule has two 64-row consumers sharing each staged K, V, and
+residual-mask tile, giving `R=128`. It retains `Bc=64`, two K/V stages, FP32
+pair bias, no cluster multicast, and register-sourced P for PV. Under the same
+machine-rate assumptions, its roofline is:
+
+| N | DRAM | L2 to SMEM | SMEM to RF | MUFU | CUDA | tensor | Binding floor |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | **10.2 us** | 9.7 us | 1.4 us | 2.3 us | 2.8 us | 2.2 us | DRAM |
+| 384 | 91.7 us | **217.1 us** | 33.0 us | 62.0 us | 76.3 us | 58.6 us | L2 |
+| 1024 | 652.3 us | **3856.4 us** | 595.0 us | 1175.8 us | 1446.1 us | 1110.6 us | L2 |
+
+The corresponding L2 arithmetic intensity changes are:
+
+| N | Initial `R=64` | Final `R=128` | L2-floor reduction |
+|---:|---:|---:|---:|
+| 128 | 25.36 FLOP/B | 31.75 FLOP/B | 1.25x |
+| 384 | 29.29 FLOP/B | 38.16 FLOP/B | 1.30x |
+| 1024 | 30.78 FLOP/B | 40.73 FLOP/B | 1.32x |
+
+Only the larger reuse width changes the idealized L2 byte count: two consumers
+reuse one K/V/mask transfer across 128 query rows. `Bc=64` does not reduce
+useful L2 traffic because `Bc` cancels between bytes per iteration and the
+`N/Bc` iteration count. Its smaller fragments instead make the two-CTA
+occupancy possible.
+
+Likewise, RMEM PV and the SW128 pair-bias layout do not move the ideal L2
+roofline. RMEM PV removes the probability tile's SMEM round trip and reduces
+resource pressure. SW128 reduces TMA decomposition and improves the
+shared-memory consumption pattern for the same pair-bias payload. Together
+with two resident CTAs, these changes improve latency hiding and the fraction
+of the L2 roofline that the kernel can actually attain.
+
+The original table already assumed register-sourced P in its SMEM-to-RF byte
+model, even though that optimization had not yet been implemented when the
+first kernel variants were measured. Consequently, the two tables should be
+read as a change in analytical schedules (`R=64` to `R=128`), not as a literal
+before/after model of every intermediate implementation.
+
+The final schedule therefore mitigates but does not remove L2 boundedness. At
+long sequence lengths, FP32 pair bias remains the irreducible term and accounts
+for roughly two-thirds of the main-loop L2 payload. Reducing that term would
+require cross-CTA pair-bias multicast or persistent reuse; neither is enabled
+in the retained universal kernel.
+
+#### FlashAttention-3 roofline comparison
+
+KernelWiki does not contain a numerical FlashAttention-3 roofline table. It
+does contain source-reported evidence for FA3-style Hopper warp specialization
+and two-consumer-warpgroup pipelines (`pr-flashinfer-887` and
+`pr-flashinfer-952`). The numerical table below is therefore a local derivation
+using those scheduling principles and the same H100 rates as section 3; it is
+not a performance claim copied from KernelWiki.
+
+For an apples-to-apples algorithmic comparison, the model applies noncausal
+BF16 FlashAttention independently to the same `B*S*H` attention matrices as
+EvoAttention, with `S=N`, `D=64`, BF16 output, and FP32 LSE. Canonical
+FlashAttention does not itself have the extra `S` axis; replicating it over `S`
+only puts the two algorithms on the same logical-logit count. The controlled
+FA3-style schedule uses `R=128`, `Bc=64`, register-sourced probabilities, and
+no dropout, pair bias, or residual mask.
+
+Let `P_problem = B*S*H` and let `Cq` be the K/V multicast factor across query
+CTAs. The relevant traffic is
+
+```text
+b_DRAM,FA3 = P_problem * (4*N*D*e_q + N*e_a)
+                            |              |
+                            |              +-- FP32 LSE
+                            +----------------- BF16 Q, K, V, and O
+
+b_L2,FA3 = P_problem * N * [2*D*e_q
+                             + 2*N*D*e_q/(R*Cq)
+                             + e_a]
+                               |       |       |
+                               |       |       +-- FP32 LSE
+                               |       +---------- K/V restreaming
+                               +------------------ Q load and O store
+
+b_SMEM,FA3 ~= P_problem * N * D * e_q
+```
+
+The SMEM expression counts the BF16 output accumulator staging required for
+TMA store. Q, K, and V feed WGMMA through shared-memory descriptors and do not
+cross the ordinary SMEM-to-register datapath; probabilities remain in
+registers. The tensor and MUFU work matches EvoAttention, while the approximate
+CUDA-core work falls from `G*(9 + D/Bc)` to `G*(5 + D/Bc)` because there is no
+FP32 pair-bias or residual-mask addition.
+
+With no K/V multicast (`Cq=1`), the derived FA3-style roofline is:
+
+| N | DRAM | L2 to SMEM | SMEM to RF | MUFU | CUDA | tensor | Binding floor |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | **10.1 us** | 4.8 us | 0.3 us | 2.3 us | 1.7 us | 2.2 us | DRAM |
+| 384 | **90.9 us** | 86.6 us | 2.5 us | 62.0 us | 45.8 us | 58.6 us | DRAM |
+| 1024 | 646.1 us | **1382.9 us** | 17.9 us | 1175.8 us | 867.7 us | 1110.6 us | L2 |
+
+A two-way K/V multicast (`Cq=2`) does not change compulsory DRAM, SMEM-to-RF,
+or compute work. It changes the FA3 L2 and binding floors as follows:
+
+| N | L2 without multicast | L2 with K/V multicast-2 | Final binding floor |
+|---:|---:|---:|---:|
+| 128 | 4.8 us | 3.6 us | 10.1 us DRAM |
+| 384 | 86.6 us | 54.3 us | 90.9 us DRAM |
+| 1024 | 1382.9 us | 769.4 us | 1175.8 us MUFU |
+
+Multicast is shown as a separate analytical variant because FA3 launch policy
+and tile selection vary by implementation and shape; the KernelWiki entries do
+not establish that every FA3 forward configuration uses cluster-two K/V
+multicast.
+
+The direct comparison with the retained EvoAttention schedule is:
+
+| N | Evo L2 intensity | FA3 intensity, no multicast | FA3 intensity, K/V multicast-2 | Evo binding floor | FA3 binding floor, no multicast |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 31.75 FLOP/B | 63.50 FLOP/B | 84.45 FLOP/B | 10.2 us DRAM | 10.1 us DRAM |
+| 384 | 38.16 FLOP/B | 95.63 FLOP/B | 152.65 FLOP/B | 217.1 us L2 | 90.9 us DRAM |
+| 1024 | 40.73 FLOP/B | 113.58 FLOP/B | 204.16 FLOP/B | 3856.4 us L2 | 1382.9 us L2 |
+
+At short sequence lengths, compulsory Q/K/V/O traffic makes both algorithms
+DRAM-limited. At medium lengths, ordinary FlashAttention is near the crossover
+between DRAM, L2, tensor, and MUFU limits, whereas EvoAttention is already
+strongly L2-bound. At long lengths, non-multicast FA3 is only narrowly
+L2-bound; K/V multicast-2 moves its theoretical bottleneck to MUFU. The same
+multicast cannot remove EvoAttention's FP32 pair-bias stream, which is why the
+optimized EvoAttention intensity remains about one third of non-multicast FA3
+at `N=1024`.
+
 ## 6. Experiments that did not survive
 
 ### 6.1 S-fast CTA raster
@@ -1074,6 +1213,8 @@ The implementation choices are consistent with these KernelWiki pages:
 - hw-mbarrier, wiki/hardware/mbarrier.md
 - technique-warp-specialization, wiki/techniques/warp-specialization.md
 - lang-cute-dsl, wiki/languages/cute-dsl.md
+- pr-flashinfer-887, sources/prs/flashinfer/PR-887.md
+- pr-flashinfer-952, sources/prs/flashinfer/PR-952.md
 
 These are source-reported references. They support the TMA issue model,
 Hopper WGMMA participation granularity, warp specialization, layout-aware
