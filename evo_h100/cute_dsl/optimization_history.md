@@ -128,29 +128,36 @@ the two-stage ring.
 
 ## 3. Initial roofline diagnosis
 
-The initial model used these H100 rates:
+The model uses the updated H100 bandwidth assumptions below. Every memory
+floor is recomputed as `traffic / bandwidth`; the compute-pipe rates are
+unchanged.
 
 | Resource | Assumed peak |
 |---|---:|
-| HBM to L2 | 3.35 TB/s |
-| L2 to shared memory | 7 TB/s |
-| Shared memory to registers | 30 TB/s |
+| HBM to L2 | 3 TB/s |
+| L2 to shared memory | 12 TB/s |
+| L1/shared-memory path to registers | 33 TB/s |
 | FP32 CUDA cores | 29.7 T scalar operations/s |
 | MUFU exponential | 3.71 T results/s |
 | BF16 tensor cores | 990 TFLOP/s |
 
+Relative to the 990 TFLOP/s tensor peak, the three bandwidth ridges are
+330 FLOP/byte for DRAM, 82.5 FLOP/byte for L2, and 30 FLOP/byte for the
+L1/shared-memory path.
+
 With one 64-row consumer (`Mq=R=64`), `Bc=64`, and no multicast, the predicted
 B=1, H=4 lower bounds were:
 
-| N | DRAM | L2 to SMEM | SMEM to RF | MUFU | CUDA | tensor |
+| N | DRAM | L2 to SMEM | L1/SMEM to RF | MUFU | CUDA | tensor |
 |---:|---:|---:|---:|---:|---:|---:|
-| 128 | 10.2 us | 12.1 us | 1.4 us | 2.3 us | 2.8 us | 2.2 us |
-| 384 | 91.7 us | 282.8 us | 33.2 us | 62.0 us | 76.3 us | 58.6 us |
-| 1024 | 652.3 us | 5102.7 us | 599.5 us | 1175.8 us | 1446.1 us | 1110.6 us |
+| 128 | 11.4 us | 7.1 us | 1.3 us | 2.3 us | 2.8 us | 2.2 us |
+| 384 | 102.4 us | 165.0 us | 30.2 us | 62.0 us | 76.3 us | 58.6 us |
+| 1024 | 728.4 us | 2976.6 us | 545.0 us | 1175.8 us | 1446.1 us | 1110.6 us |
 
 The important difference from ordinary FlashAttention is the FP32 pair-bias
 term. Even with ideal K/V reuse, L2 intensity asymptotically approaches only
-64 tensor FLOP/byte. The modeled H100 L2 ridge is about 141 FLOP/byte.
+64 tensor FLOP/byte. The updated H100 L2 ridge is `990/12 = 82.5`
+tensor FLOP/byte.
 Therefore pair-bias traffic moves the medium and long shapes toward an L2
 bottleneck, while N=128 remains dominated by fixed pipeline and scheduling
 latency.
@@ -814,22 +821,22 @@ can move the ratio across 2x.
 For direct comparison, this is the initial analytical table from section 3.
 It models one 64-row consumer, so the CTA-level K/V reuse width is `R=64`:
 
-| N | DRAM | L2 to SMEM | SMEM to RF | MUFU | CUDA | tensor |
+| N | DRAM | L2 to SMEM | L1/SMEM to RF | MUFU | CUDA | tensor |
 |---:|---:|---:|---:|---:|---:|---:|
-| 128 | 10.2 us | 12.1 us | 1.4 us | 2.3 us | 2.8 us | 2.2 us |
-| 384 | 91.7 us | 282.8 us | 33.2 us | 62.0 us | 76.3 us | 58.6 us |
-| 1024 | 652.3 us | 5102.7 us | 599.5 us | 1175.8 us | 1446.1 us | 1110.6 us |
+| 128 | 11.4 us | 7.1 us | 1.3 us | 2.3 us | 2.8 us | 2.2 us |
+| 384 | 102.4 us | 165.0 us | 30.2 us | 62.0 us | 76.3 us | 58.6 us |
+| 1024 | 728.4 us | 2976.6 us | 545.0 us | 1175.8 us | 1446.1 us | 1110.6 us |
 
 The retained schedule has two 64-row consumers sharing each staged K, V, and
 residual-mask tile, giving `R=128`. It retains `Bc=64`, two K/V stages, FP32
 pair bias, no cluster multicast, and register-sourced P for PV. Under the same
 machine-rate assumptions, its roofline is:
 
-| N | DRAM | L2 to SMEM | SMEM to RF | MUFU | CUDA | tensor | Binding floor |
+| N | DRAM | L2 to SMEM | L1/SMEM to RF | MUFU | CUDA | tensor | Binding floor |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 128 | **10.2 us** | 9.7 us | 1.4 us | 2.3 us | 2.8 us | 2.2 us | DRAM |
-| 384 | 91.7 us | **217.1 us** | 33.0 us | 62.0 us | 76.3 us | 58.6 us | L2 |
-| 1024 | 652.3 us | **3856.4 us** | 595.0 us | 1175.8 us | 1446.1 us | 1110.6 us | L2 |
+| 128 | **11.4 us** | 5.6 us | 1.3 us | 2.3 us | 2.8 us | 2.2 us | DRAM |
+| 384 | 102.4 us | **126.6 us** | 30.0 us | 62.0 us | 76.3 us | 58.6 us | L2 |
+| 1024 | 728.4 us | **2249.5 us** | 540.9 us | 1175.8 us | 1446.1 us | 1110.6 us | L2 |
 
 The corresponding L2 arithmetic intensity changes are:
 
@@ -910,20 +917,20 @@ FP32 pair-bias or residual-mask addition.
 
 With no K/V multicast (`Cq=1`), the derived FA3-style roofline is:
 
-| N | DRAM | L2 to SMEM | SMEM to RF | MUFU | CUDA | tensor | Binding floor |
+| N | DRAM | L2 to SMEM | L1/SMEM to RF | MUFU | CUDA | tensor | Binding floor |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 128 | **10.1 us** | 4.8 us | 0.3 us | 2.3 us | 1.7 us | 2.2 us | DRAM |
-| 384 | **90.9 us** | 86.6 us | 2.5 us | 62.0 us | 45.8 us | 58.6 us | DRAM |
-| 1024 | 646.1 us | **1382.9 us** | 17.9 us | 1175.8 us | 867.7 us | 1110.6 us | L2 |
+| 128 | **11.3 us** | 2.8 us | 0.3 us | 2.3 us | 1.7 us | 2.2 us | DRAM |
+| 384 | **101.4 us** | 50.5 us | 2.3 us | 62.0 us | 45.8 us | 58.6 us | DRAM |
+| 1024 | 721.4 us | 806.7 us | 16.3 us | **1175.8 us** | 867.7 us | 1110.6 us | MUFU |
 
 A two-way K/V multicast (`Cq=2`) does not change compulsory DRAM, SMEM-to-RF,
 or compute work. It changes the FA3 L2 and binding floors as follows:
 
 | N | L2 without multicast | L2 with K/V multicast-2 | Final binding floor |
 |---:|---:|---:|---:|
-| 128 | 4.8 us | 3.6 us | 10.1 us DRAM |
-| 384 | 86.6 us | 54.3 us | 90.9 us DRAM |
-| 1024 | 1382.9 us | 769.4 us | 1175.8 us MUFU |
+| 128 | 2.8 us | 2.1 us | 11.3 us DRAM |
+| 384 | 50.5 us | 31.7 us | 101.4 us DRAM |
+| 1024 | 806.7 us | 448.8 us | 1175.8 us MUFU |
 
 Multicast is shown as a separate analytical variant because FA3 launch policy
 and tile selection vary by implementation and shape; the KernelWiki entries do
@@ -934,18 +941,19 @@ The direct comparison with the retained EvoAttention schedule is:
 
 | N | Evo L2 intensity | FA3 intensity, no multicast | FA3 intensity, K/V multicast-2 | Evo binding floor | FA3 binding floor, no multicast |
 |---:|---:|---:|---:|---:|---:|
-| 128 | 31.75 FLOP/B | 63.50 FLOP/B | 84.45 FLOP/B | 10.2 us DRAM | 10.1 us DRAM |
-| 384 | 38.16 FLOP/B | 95.63 FLOP/B | 152.65 FLOP/B | 217.1 us L2 | 90.9 us DRAM |
-| 1024 | 40.73 FLOP/B | 113.58 FLOP/B | 204.16 FLOP/B | 3856.4 us L2 | 1382.9 us L2 |
+| 128 | 31.75 FLOP/B | 63.50 FLOP/B | 84.45 FLOP/B | 11.4 us DRAM | 11.3 us DRAM |
+| 384 | 38.16 FLOP/B | 95.63 FLOP/B | 152.65 FLOP/B | 126.6 us L2 | 101.4 us DRAM |
+| 1024 | 40.73 FLOP/B | 113.58 FLOP/B | 204.16 FLOP/B | 2249.5 us L2 | 1175.8 us MUFU |
 
 At short sequence lengths, compulsory Q/K/V/O traffic makes both algorithms
-DRAM-limited. At medium lengths, ordinary FlashAttention is near the crossover
-between DRAM, L2, tensor, and MUFU limits, whereas EvoAttention is already
-strongly L2-bound. At long lengths, non-multicast FA3 is only narrowly
-L2-bound; K/V multicast-2 moves its theoretical bottleneck to MUFU. The same
-multicast cannot remove EvoAttention's FP32 pair-bias stream, which is why the
-optimized EvoAttention intensity remains about one third of non-multicast FA3
-at `N=1024`.
+DRAM-limited. At medium lengths, ordinary FlashAttention remains DRAM-bound,
+whereas EvoAttention is already strongly L2-bound. At long lengths, the
+higher 12 TB/s L2 assumption makes the FA3-style schedule MUFU-bound even
+without multicast; multicast increases its L2 headroom but no longer changes
+the binding pipe. The same multicast cannot
+remove EvoAttention's FP32 pair-bias stream, which is why optimized
+EvoAttention remains L2-bound and its intensity is about one third of
+non-multicast FA3 at `N=1024`.
 
 ## 6. Experiments that did not survive
 
