@@ -202,18 +202,11 @@ def gemm_kernel(
             phaseB ^= 1
             mmaPhase ^= 1
 
-    ## Partition the accumulator and output into the same epilogue tiles before
-    ## deriving the TMEM copy. This preserves the MMA C-coordinate hierarchy in
-    ## the TMEM-to-register and register-to-global mappings.
+    ## Prepare the global-memory C tile. The CTA tile and TMEM load tile are both
+    ## 64x64, so no additional epilogue sub-tiling is needed.
     cZipped = tiled_mma.get_slice(0).partition_C(
         c[((None, None), (bidy, bidx))]
     )
-    epi_tiler = ((
-        cute.size(cTmem, mode=[0, 0]),
-        cute.size(cTmem, mode=[0, 1]),
-    ),)
-    cTmem_epi = cute.zipped_divide(cTmem, epi_tiler)
-    cGmem_epi = cute.zipped_divide(cZipped, epi_tiler)
 
     ## We will directly build the copy atom. ##
     copy_atom_t2r = cute.make_copy_atom(
@@ -222,28 +215,23 @@ def gemm_kernel(
     )
 
     tiled_copy_t2r = cute.nvgpu.tcgen05.make_tmem_copy(
-        copy_atom_t2r, cTmem_epi[None, 0]
+        copy_atom_t2r, cTmem
     )
 
     thr_copy_t2r = tiled_copy_t2r.get_slice(tidy * dimx + tidx)
 
-    sCopyTmem = thr_copy_t2r.partition_S(cTmem_epi)
-    dGmem = thr_copy_t2r.partition_D(cGmem_epi)
+    sCopyTmem = thr_copy_t2r.partition_S(cTmem)
+    dGmem = thr_copy_t2r.partition_D(cZipped)
 
     dRmem = cute.make_rmem_tensor(
-        dGmem[None, None, 0].shape, dtype=cutlass.Float32
+        dGmem.shape, dtype=cutlass.Float32
     )
 
     ## Epilogue writeback needs special care. ##
     tmem_alloc.relinquish_alloc_permit()
     cute.arch.sync_threads()
-    for epi_idx in cutlass.range(cute.size(sCopyTmem, mode=[2])):
-        cute.copy(
-            tiled_copy_t2r,
-            sCopyTmem[None, None, epi_idx],
-            dRmem,
-        )
-        dGmem[None, None, epi_idx][None] = dRmem.load().to(cutlass.BFloat16)
+    cute.copy(tiled_copy_t2r, sCopyTmem, dRmem)
+    dGmem[None] = dRmem.load().to(cutlass.BFloat16)
     cute.arch.sync_threads()
     ## Finally, we free up the tmem memory. ##
     tmem_alloc.free(tmem_ptr, num_columns=tmem_cols)
