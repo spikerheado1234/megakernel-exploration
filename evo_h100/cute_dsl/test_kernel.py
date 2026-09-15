@@ -6,7 +6,7 @@ correctness comparison and the benchmark in ``benchmark.py``.
 
 Prepared tensor contract
 ------------------------
-    q, k, v, out:  contiguous [B, S, H, N, 64], bfloat16
+    q, k, v, out:  contiguous [B, S, H, N, D],  bfloat16
     pair_bias:     contiguous [B, H, N, N],       float32
     res_mask:      contiguous [B, S, N],          float32, values 0 or -1e9
     lse:           contiguous [B, S, H, N],       float32
@@ -19,7 +19,8 @@ this signature::
 
 The returned object must also expose an integer ``compile_count`` property.
 All B/H/N modes are runtime dynamic, so it must remain one after all 32 shapes
-have run.  D=64 and the kernel tile/schedule are intentionally static.
+have run. D is selected once per test run from the static D=32 and D=64 kernel
+specializations.
 """
 
 from __future__ import annotations
@@ -47,7 +48,8 @@ REFERENCE_PATH = Path(
     )
 )
 
-HEAD_DIMENSION = 64
+SUPPORTED_HEAD_DIMENSIONS = (32, 64)
+HEAD_DIMENSION = 32
 SEQUENCE_LENGTHS = (128, 256, 384, 512, 640, 768, 896, 1024)
 BATCH_SIZES = (1, 4)
 HEAD_COUNTS = (4, 16)
@@ -67,6 +69,7 @@ class EvoAttentionShape:
     batch_size: int
     num_heads: int
     context_length: int
+    head_dimension: int = HEAD_DIMENSION
 
     @property
     def num_sequences(self) -> int:
@@ -76,7 +79,7 @@ class EvoAttentionShape:
     def tag(self) -> str:
         return (
             f"B={self.batch_size}, S=N={self.context_length}, "
-            f"H={self.num_heads}, D={HEAD_DIMENSION}"
+            f"H={self.num_heads}, D={self.head_dimension}"
         )
 
 
@@ -115,13 +118,20 @@ class ForwardKernel(Protocol):
     ) -> None: ...
 
 
-def target_shapes() -> tuple[EvoAttentionShape, ...]:
+def target_shapes(
+    head_dimension: int = HEAD_DIMENSION,
+) -> tuple[EvoAttentionShape, ...]:
     """The exact 32-shape acceptance matrix."""
+    if head_dimension not in SUPPORTED_HEAD_DIMENSIONS:
+        raise ValueError(
+            f"head dimension must be one of {SUPPORTED_HEAD_DIMENSIONS}"
+        )
     return tuple(
         EvoAttentionShape(
             batch_size=batch,
             num_heads=heads,
             context_length=n,
+            head_dimension=head_dimension,
         )
         for batch in BATCH_SIZES
         for heads in HEAD_COUNTS
@@ -191,13 +201,14 @@ def make_inputs(
         ^ (shape.batch_size * 0x1F1F)
         ^ (shape.num_heads * 0x101)
         ^ shape.context_length
+        ^ (shape.head_dimension * 0x10001)
     )
     qkv_shape = (
         shape.batch_size,
         shape.num_sequences,
         shape.num_heads,
         shape.context_length,
-        HEAD_DIMENSION,
+        shape.head_dimension,
     )
     q = torch.randn(qkv_shape, dtype=torch.bfloat16, device=device, generator=generator)
     k = torch.randn(qkv_shape, dtype=torch.bfloat16, device=device, generator=generator)
@@ -253,7 +264,7 @@ def launch_reference(inputs: EvoAttentionInputs, outputs: EvoAttentionOutputs) -
     output = outputs.output
     logsumexp = outputs.logsumexp
     batch, n_seq, heads, n_ctx, dim = q.shape
-    if n_seq != n_ctx or dim != HEAD_DIMENSION:
+    if n_seq != n_ctx or dim not in SUPPORTED_HEAD_DIMENSIONS:
         raise ValueError(f"unsupported prepared Q shape: {tuple(q.shape)}")
 
     # The unmodified reference flattens B*S*H into CUDA grid.y.  CUDA limits
@@ -320,7 +331,7 @@ def launch_reference(inputs: EvoAttentionInputs, outputs: EvoAttentionOutputs) -
         N_SEQ=n_seq,
         SEQ_LEN=n_ctx,
         DIM=dim,
-        BLOCK_DIM=64,
+        BLOCK_DIM=dim,
         BLOCK_SIZE_Q=16,
         BLOCK_SIZE_KV=64,
         num_stages=3,
@@ -470,14 +481,15 @@ def select_shapes(
     context_length: int | None = None,
     batch_size: int | None = None,
     num_heads: int | None = None,
+    head_dimension: int = HEAD_DIMENSION,
 ) -> tuple[EvoAttentionShape, ...]:
     """Filter the acceptance matrix for command-line smoke runs."""
-    shapes: Sequence[EvoAttentionShape] = target_shapes()
+    shapes: Sequence[EvoAttentionShape] = target_shapes(head_dimension)
     if quick:
         shapes = (
-            EvoAttentionShape(1, 4, 128),
-            EvoAttentionShape(1, 16, 384),
-            EvoAttentionShape(4, 4, 640),
+            EvoAttentionShape(1, 4, 128, head_dimension),
+            EvoAttentionShape(1, 16, 384, head_dimension),
+            EvoAttentionShape(4, 4, 640, head_dimension),
         )
     if context_length is not None:
         shapes = tuple(
@@ -496,6 +508,13 @@ def main() -> None:
     parser.add_argument("--n", type=int, choices=SEQUENCE_LENGTHS)
     parser.add_argument("--batch", type=int, choices=BATCH_SIZES)
     parser.add_argument("--heads", type=int, choices=HEAD_COUNTS)
+    parser.add_argument(
+        "--head-dim",
+        "--d",
+        type=int,
+        choices=SUPPORTED_HEAD_DIMENSIONS,
+        default=HEAD_DIMENSION,
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -508,6 +527,7 @@ def main() -> None:
         context_length=args.n,
         batch_size=args.batch,
         num_heads=args.heads,
+        head_dimension=args.head_dim,
     ):
         stats = run_correctness_case(forward, shape, device=device, seed=args.seed)
         print(
@@ -525,6 +545,7 @@ __all__ = [
     "HEAD_COUNTS",
     "HEAD_DIMENSION",
     "SEQUENCE_LENGTHS",
+    "SUPPORTED_HEAD_DIMENSIONS",
     "EvoAttentionInputs",
     "EvoAttentionOutputs",
     "EvoAttentionShape",

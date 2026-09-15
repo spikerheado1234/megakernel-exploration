@@ -8,11 +8,12 @@ dQ/dK/dV/dPairBias; this includes the reference's three output transposes.
 Combined timing encloses a dependent forward followed by the complete backward
 pass in one CUDA-event range. One CUDA graph is captured per rotating address
 slot so Python launch gaps are excluded. The default run covers all 32 shapes
-and enforces a 2x CuTe speedup.
+at D=32 and enforces a 2x CuTe speedup; pass ``--head-dim 64`` (or ``--d 64``)
+to benchmark the D=64 specialization.
 
 Examples:
     CUDA_VISIBLE_DEVICES=1 python benchmark.py --direction combined
-    CUDA_VISIBLE_DEVICES=2 python benchmark.py --direction forward
+    CUDA_VISIBLE_DEVICES=2 python benchmark.py --direction forward --head-dim 64
     CUDA_VISIBLE_DEVICES=3 python benchmark.py --direction backward --quick
 """
 
@@ -31,8 +32,8 @@ import torch
 import triton
 
 from test_kernel import (
-    HEAD_DIMENSION,
     SEQUENCE_LENGTHS,
+    SUPPORTED_HEAD_DIMENSIONS,
     EvoAttentionInputs,
     EvoAttentionOutputs,
     EvoAttentionShape,
@@ -54,7 +55,6 @@ DEFAULT_TARGET_MS = 200.0
 MIN_ITERS = 3
 MAX_ITERS = 1000
 REQUIRED_SPEEDUP = 2.0
-SOFTMAX_SCALE = HEAD_DIMENSION**-0.5
 INPUT_POOL_BUDGET_BYTES = 2 * 1024**3
 BACKWARD_POOL_BUDGET_BYTES = 70 * 1024**3
 COMBINED_POOL_BUDGET_BYTES = 80 * 1024**3
@@ -80,6 +80,7 @@ class BenchmarkResult:
     batch_size: int
     num_heads: int
     context_length: int
+    head_dimension: int
     pool_slots: int
     triton: TimingStats
     cute: TimingStats
@@ -94,6 +95,7 @@ class BenchmarkResult:
             self.batch_size,
             self.num_heads,
             self.context_length,
+            self.head_dimension,
         ) / (self.triton.median_ms * 1.0e9)
 
     @property
@@ -102,6 +104,7 @@ class BenchmarkResult:
             self.batch_size,
             self.num_heads,
             self.context_length,
+            self.head_dimension,
         ) / (self.cute.median_ms * 1.0e9)
 
 
@@ -219,6 +222,7 @@ class BackwardBenchmarkResult:
     batch_size: int
     num_heads: int
     context_length: int
+    head_dimension: int
     pool_slots: int
     triton: TimingStats
     cute: TimingStats
@@ -234,6 +238,7 @@ class BackwardBenchmarkResult:
             self.batch_size,
             self.num_heads,
             self.context_length,
+            self.head_dimension,
         ) / (self.cute.median_ms * 1.0e9)
 
 
@@ -242,6 +247,7 @@ class CombinedBenchmarkResult:
     batch_size: int
     num_heads: int
     context_length: int
+    head_dimension: int
     pool_slots: int
     backward_batch_chunk: int
     triton: TimingStats
@@ -257,6 +263,7 @@ class CombinedBenchmarkResult:
             self.batch_size,
             self.num_heads,
             self.context_length,
+            self.head_dimension,
         ) / (self.triton.median_ms * 1.0e9)
 
     @property
@@ -265,6 +272,7 @@ class CombinedBenchmarkResult:
             self.batch_size,
             self.num_heads,
             self.context_length,
+            self.head_dimension,
         ) / (self.cute.median_ms * 1.0e9)
 
 
@@ -275,7 +283,7 @@ def _slot_bytes(shape: EvoAttentionShape) -> int:
         * shape.num_sequences
         * shape.num_heads
         * shape.context_length
-        * HEAD_DIMENSION
+        * shape.head_dimension
     )
     pair_bias_elements = (
         shape.batch_size * shape.num_heads * shape.context_length * shape.context_length
@@ -380,11 +388,17 @@ def _flops_from_dimensions(
     batch_size: int,
     num_heads: int,
     context_length: int,
+    head_dimension: int,
 ) -> int:
     # QK^T and PV, two FLOPs per multiply-accumulate.  The softmax and bias
     # arithmetic are intentionally omitted, matching standard FA reporting.
     return (
-        4 * batch_size * context_length * num_heads * context_length**2 * HEAD_DIMENSION
+        4
+        * batch_size
+        * context_length
+        * num_heads
+        * context_length**2
+        * head_dimension
     )
 
 
@@ -392,6 +406,7 @@ def _backward_flops_from_dimensions(
     batch_size: int,
     num_heads: int,
     context_length: int,
+    head_dimension: int,
 ) -> int:
     """Return algorithmic backward FLOPs for its five matrix products."""
     return (
@@ -400,7 +415,7 @@ def _backward_flops_from_dimensions(
         * context_length
         * num_heads
         * context_length**2
-        * HEAD_DIMENSION
+        * head_dimension
     )
 
 
@@ -408,16 +423,19 @@ def _combined_flops_from_dimensions(
     batch_size: int,
     num_heads: int,
     context_length: int,
+    head_dimension: int,
 ) -> int:
     """Return forward plus backward algorithmic FLOPs."""
     return _flops_from_dimensions(
         batch_size,
         num_heads,
         context_length,
+        head_dimension,
     ) + _backward_flops_from_dimensions(
         batch_size,
         num_heads,
         context_length,
+        head_dimension,
     )
 
 
@@ -474,6 +492,7 @@ def benchmark_shape(
         batch_size=shape.batch_size,
         num_heads=shape.num_heads,
         context_length=shape.context_length,
+        head_dimension=shape.head_dimension,
         pool_slots=len(pool),
         triton=triton_timing,
         cute=cute_timing,
@@ -497,13 +516,14 @@ def _make_public_inputs(
         ^ (shape.batch_size * 0x1F1F)
         ^ (shape.num_heads * 0x101)
         ^ shape.context_length
+        ^ (shape.head_dimension * 0x10001)
     )
     public_shape = (
         shape.batch_size,
         shape.num_sequences,
         shape.context_length,
         shape.num_heads,
-        HEAD_DIMENSION,
+        shape.head_dimension,
     )
     q = torch.randn(
         public_shape, dtype=torch.bfloat16, device=device, generator=generator
@@ -581,7 +601,7 @@ def _make_triton_backward_slot(
         shape.num_sequences,
         shape.num_heads,
         shape.context_length,
-        HEAD_DIMENSION,
+        shape.head_dimension,
     )
     statistics_shape = gradient_shape[:-1]
     buffers = BackwardBuffers(
@@ -756,7 +776,7 @@ def _backward_activation_elements(shape: EvoAttentionShape) -> int:
         * shape.num_sequences
         * shape.context_length
         * shape.num_heads
-        * HEAD_DIMENSION
+        * shape.head_dimension
     )
 
 
@@ -922,7 +942,7 @@ def _launch_triton_backward_chunk(reference, buffers: BackwardBuffers) -> None:
         D=delta,
         SEQ_LEN=context_length,
         DIM=dimension,
-        BLOCK_DIM=64,
+        BLOCK_DIM=dimension,
         BLOCK_SIZE_Q=32,
         num_stages=2,
         num_warps=4,
@@ -933,7 +953,7 @@ def _launch_triton_backward_chunk(reference, buffers: BackwardBuffers) -> None:
         V=v,
         res_mask=residual_mask,
         pair_bias=pair_bias,
-        softmax_scale=SOFTMAX_SCALE,
+        softmax_scale=dimension**-0.5,
         dO=output_gradient,
         dQ=dq,
         dK=dk,
@@ -954,7 +974,7 @@ def _launch_triton_backward_chunk(reference, buffers: BackwardBuffers) -> None:
         HEAD=heads,
         N_SEQ=sequence_count,
         SEQ_LEN=context_length,
-        BLOCK_DIM=64,
+        BLOCK_DIM=dimension,
         DIM=dimension,
     )
     reference._attn_bwd_dk_dv[(triton.cdiv(context_length, 16), problem_count, 1)](
@@ -1182,6 +1202,7 @@ def benchmark_backward_shape(
         batch_size=shape.batch_size,
         num_heads=shape.num_heads,
         context_length=shape.context_length,
+        head_dimension=shape.head_dimension,
         pool_slots=pool_slots,
         triton=triton_timing,
         cute=cute_timing,
@@ -1267,6 +1288,7 @@ def benchmark_combined_shape(
         batch_size=shape.batch_size,
         num_heads=shape.num_heads,
         context_length=shape.context_length,
+        head_dimension=shape.head_dimension,
         pool_slots=pool_slots,
         backward_batch_chunk=backward_batch_chunk,
         triton=triton_timing,
@@ -1276,17 +1298,18 @@ def benchmark_combined_shape(
 
 def _print_forward_header() -> None:
     print(
-        f"{'B':>2} {'H':>3} {'N=S':>5} {'slots':>5}  "
+        f"{'B':>2} {'H':>3} {'D':>3} {'N=S':>5} {'slots':>5}  "
         f"{'Triton ms':>11} {'CuTe ms':>11} {'speedup':>9}  "
         f"{'Triton TF/s':>12} {'CuTe TF/s':>10} {'iters':>6} {'pass':>5}"
     )
-    print("-" * 106)
+    print("-" * 110)
 
 
 def _print_forward_result(result: BenchmarkResult, required_speedup: float) -> None:
     passed = result.speedup >= required_speedup
     print(
         f"{result.batch_size:2d} {result.num_heads:3d} "
+        f"{result.head_dimension:3d} "
         f"{result.context_length:5d} {result.pool_slots:5d}  "
         f"{result.triton.median_ms:11.4f} {result.cute.median_ms:11.4f} "
         f"{result.speedup:8.3f}x  {result.triton_tflops:12.2f} "
@@ -1298,11 +1321,12 @@ def _print_forward_result(result: BenchmarkResult, required_speedup: float) -> N
 
 def _print_combined_header() -> None:
     print(
-        f"{'B':>2} {'H':>3} {'N=S':>5} {'slots':>5} {'bwd chunk':>9}  "
+        f"{'B':>2} {'H':>3} {'D':>3} {'N=S':>5} "
+        f"{'slots':>5} {'bwd chunk':>9}  "
         f"{'Triton ms':>11} {'CuTe ms':>11} {'speedup':>9}  "
         f"{'Triton TF/s':>12} {'CuTe TF/s':>10} {'iters':>6} {'pass':>5}"
     )
-    print("-" * 117)
+    print("-" * 121)
 
 
 def _print_combined_result(
@@ -1312,6 +1336,7 @@ def _print_combined_result(
     passed = result.speedup >= required_speedup
     print(
         f"{result.batch_size:2d} {result.num_heads:3d} "
+        f"{result.head_dimension:3d} "
         f"{result.context_length:5d} {result.pool_slots:5d} "
         f"{result.backward_batch_chunk:9d}  "
         f"{result.triton.median_ms:11.4f} {result.cute.median_ms:11.4f} "
@@ -1338,6 +1363,7 @@ def _write_json(
         serialized_results.append(serialized)
     payload = {
         "device": torch.cuda.get_device_name(torch.cuda.current_device()),
+        "head_dimension": args.head_dim,
         "required_speedup": args.required_speedup,
         "timing": (
             "CUDA events, prepared-layout kernel only, median of repeat "
@@ -1366,6 +1392,7 @@ def _write_backward_json(
     payload = {
         "direction": "backward",
         "device": torch.cuda.get_device_name(torch.cuda.current_device()),
+        "head_dimension": args.head_dim,
         "required_speedup": args.required_speedup,
         "compile_count": compile_count,
         "timing": (
@@ -1400,6 +1427,7 @@ def _write_combined_json(
     payload = {
         "direction": "combined",
         "device": torch.cuda.get_device_name(torch.cuda.current_device()),
+        "head_dimension": args.head_dim,
         "required_speedup": args.required_speedup,
         "compile_count": {
             "forward": forward_compile_count,
@@ -1433,16 +1461,17 @@ def _run_backward_benchmark(
     backward = get_evoattention_backward()
     results: list[BackwardBenchmarkResult] = []
     print(
-        f"{'B':>2} {'H':>3} {'N=S':>5} {'slots':>5}  "
+        f"{'B':>2} {'H':>3} {'D':>3} {'N=S':>5} {'slots':>5}  "
         f"{'Triton ms':>11} {'CuTe ms':>11} {'speedup':>9}  "
         f"{'CuTe TF/s':>10} {'iters':>6} {'pass':>5}"
     )
-    print("-" * 104)
+    print("-" * 108)
     for shape in select_shapes(
         quick=args.quick,
         context_length=args.n,
         batch_size=args.batch,
         num_heads=args.heads,
+        head_dimension=args.head_dim,
     ):
         result = benchmark_backward_shape(
             backward,
@@ -1458,6 +1487,7 @@ def _run_backward_benchmark(
         passed = result.speedup >= args.required_speedup
         print(
             f"{result.batch_size:2d} {result.num_heads:3d} "
+            f"{result.head_dimension:3d} "
             f"{result.context_length:5d} {result.pool_slots:5d}  "
             f"{result.triton.median_ms:11.4f} "
             f"{result.cute.median_ms:11.4f} {result.speedup:8.3f}x  "
@@ -1481,7 +1511,8 @@ def _run_backward_benchmark(
         print(f"wrote {args.json}")
     if failures and not args.no_enforce:
         failed = ", ".join(
-            f"B{result.batch_size}/H{result.num_heads}/N{result.context_length}"
+            f"B{result.batch_size}/H{result.num_heads}/D{result.head_dimension}/"
+            f"N{result.context_length}"
             for result in failures
         )
         raise SystemExit(f"speed target missed for: {failed}")
@@ -1502,6 +1533,7 @@ def _run_combined_benchmark(
         context_length=args.n,
         batch_size=args.batch,
         num_heads=args.heads,
+        head_dimension=args.head_dim,
     ):
         result = benchmark_combined_shape(
             forward,
@@ -1541,7 +1573,8 @@ def _run_combined_benchmark(
         print(f"wrote {args.json}")
     if failures and not args.no_enforce:
         failed = ", ".join(
-            f"B{result.batch_size}/H{result.num_heads}/N{result.context_length}"
+            f"B{result.batch_size}/H{result.num_heads}/D{result.head_dimension}/"
+            f"N{result.context_length}"
             for result in failures
         )
         raise SystemExit(f"speed target missed for: {failed}")
@@ -1558,6 +1591,14 @@ def main() -> None:
     parser.add_argument("--n", type=int, choices=SEQUENCE_LENGTHS)
     parser.add_argument("--batch", type=int, choices=(1, 4))
     parser.add_argument("--heads", type=int, choices=(4, 16))
+    parser.add_argument(
+        "--head-dim",
+        "--d",
+        type=int,
+        choices=SUPPORTED_HEAD_DIMENSIONS,
+        default=32,
+        help="attention head dimension (default: 32)",
+    )
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
     parser.add_argument(
@@ -1594,6 +1635,7 @@ def main() -> None:
 
     device = torch.device("cuda", torch.cuda.current_device())
     print(f"device: {torch.cuda.get_device_name(device)} ({device})")
+    print(f"head dimension: {args.head_dim}")
     if args.direction == "combined":
         print(
             "timing: dependent forward + complete backward, prepared inputs, "
@@ -1622,6 +1664,7 @@ def main() -> None:
         context_length=args.n,
         batch_size=args.batch,
         num_heads=args.heads,
+        head_dimension=args.head_dim,
     ):
         result = benchmark_shape(
             forward,
@@ -1648,7 +1691,8 @@ def main() -> None:
 
     if failures and not args.no_enforce:
         failed = ", ".join(
-            f"B{result.batch_size}/H{result.num_heads}/N{result.context_length}"
+            f"B{result.batch_size}/H{result.num_heads}/D{result.head_dimension}/"
+            f"N{result.context_length}"
             for result in failures
         )
         raise SystemExit(f"speed target missed for: {failed}")

@@ -2,11 +2,13 @@
 
 ## 1. Executive summary
 
-This directory contains the retained CuTe-DSL forward implementation for
-EvoAttention on NVIDIA H100 (SM90a). The implementation is intentionally
-specialized to head dimension 64 and to sequence lengths divisible by 128, but
-batch size, head count, and sequence length remain runtime dynamic. One
-TVM-FFI compilation serves the complete target matrix.
+This document describes the retained D=64 CuTe-DSL forward specialization for
+EvoAttention on NVIDIA H100 (SM90a), now stored in
+`evoattention_cute_d64.py`. The public `evoattention_cute.py` launcher inspects
+the runtime head dimension and dispatches to the independently optimized D=32
+or D=64 specialization. Within either specialization, batch size, head count,
+and sequence length remain runtime dynamic, and one TVM-FFI compilation serves
+the complete target matrix for that head dimension.
 
 The retained kernel uses:
 

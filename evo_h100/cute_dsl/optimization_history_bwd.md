@@ -2,8 +2,10 @@
 
 ## 1. Executive summary
 
-The production backward in `evoattention_cute_bwd.py` uses one fixed M64 x
-N128 Hopper main schedule.  One TVM-FFI dispatch emits FP32 dPairBias
+The D=64 production specialization in `evoattention_cute_bwd_d64.py` uses one
+fixed M64 x N128 Hopper main schedule. The public
+`evoattention_cute_bwd.py` launcher dispatches D=32 and D=64 calls from the
+runtime head dimension. One TVM-FFI dispatch emits FP32 dPairBias
 initialization, FlashAttention backward preprocessing, the fused five-MMA main
 kernel, dQ postprocessing, and FP32-to-BF16 dPairBias conversion.  For H=16
 and N>=640, the same dispatch disables main-kernel dPairBias atomics and adds a
