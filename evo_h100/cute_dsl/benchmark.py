@@ -1,8 +1,10 @@
 """EvoAttention forward, backward, and combined benchmark: Triton vs CuTe-DSL.
 
-Compilation, allocation, input layout preparation, and warmup are excluded.
-Prepared addresses rotate through a memory-bounded pool to avoid measuring an
-unrealistically hot allocation. Forward timing writes BF16 output and FP32 LSE.
+Compilation, allocation, and warmup are excluded. Forward timing starts with
+MegaFold-layout tensors and ends with MegaFold-layout output. The Triton path
+therefore includes mask conversion, three input transposes, and its output
+transpose; CuTe consumes the model layout directly. CUDA graphs remove Python
+dispatch gaps, and addresses rotate through a memory-bounded pool.
 Backward timing includes every launch/reduction needed for model-layout BF16
 dQ/dK/dV/dPairBias; this includes the reference's three output transposes.
 Combined timing encloses a dependent forward followed by the complete backward
@@ -38,12 +40,15 @@ from test_kernel import (
     EvoAttentionOutputs,
     EvoAttentionShape,
     ForwardKernel,
+    ReferenceForwardWorkspace,
     assert_single_compilation,
     launch_cute,
     launch_reference,
+    launch_reference_prepared,
     load_cute_forward,
     make_inputs,
     make_outputs,
+    make_reference_workspace,
     reference_module,
     select_shapes,
 )
@@ -110,10 +115,11 @@ class BenchmarkResult:
 
 @dataclass(frozen=True)
 class PreparedSlot:
-    """One allocation-free benchmark slot with prepared inputs and outputs."""
+    """One allocation-free model-facing forward benchmark slot."""
 
     inputs: EvoAttentionInputs
     outputs: EvoAttentionOutputs
+    reference_workspace: ReferenceForwardWorkspace
 
 
 @dataclass(frozen=True)
@@ -162,7 +168,6 @@ class CuteBackwardSlot:
 class CuteCombinedChunk:
     """One batch chunk connecting the forward output to backward inputs."""
 
-    forward_output: torch.Tensor
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
@@ -295,9 +300,10 @@ def _slot_bytes(shape: EvoAttentionShape) -> int:
         shape.batch_size * shape.num_sequences * shape.num_heads * shape.context_length
     )
     return (
-        4 * activation_elements * 2
-        + pair_bias_elements * 4
-        + residual_mask_elements * 4
+        # Public Q/K/V/output plus Triton Q/K/V/internal-output workspaces.
+        8 * activation_elements * 2
+        + pair_bias_elements * 2
+        + residual_mask_elements * (2 + 4)
         + logsumexp_elements * 4
     )
 
@@ -319,7 +325,13 @@ def _make_pool(
     pool = []
     for slot in range(_pool_size(shape)):
         inputs = make_inputs(shape, device, seed=seed + slot)
-        pool.append(PreparedSlot(inputs=inputs, outputs=make_outputs(inputs)))
+        pool.append(
+            PreparedSlot(
+                inputs=inputs,
+                outputs=make_outputs(inputs),
+                reference_workspace=make_reference_workspace(inputs),
+            )
+        )
     return tuple(pool)
 
 
@@ -452,20 +464,41 @@ def benchmark_shape(
 ) -> BenchmarkResult:
     pool = _make_pool(shape, device, seed=seed)
 
-    def triton_step(iteration: int) -> None:
+    def triton_eager_step(iteration: int) -> None:
         slot = pool[iteration % len(pool)]
-        launch_reference(slot.inputs, slot.outputs)
+        launch_reference(slot.inputs, slot.outputs, slot.reference_workspace)
 
-    def cute_step(iteration: int) -> None:
+    def cute_eager_step(iteration: int) -> None:
         slot = pool[iteration % len(pool)]
         launch_cute(forward, slot.inputs, slot.outputs)
 
     # The first call can compile/JIT.  Synchronization places all compilation
     # and initialization firmly before calibration and timed event ranges.
     with torch.inference_mode():
-        triton_step(0)
-        cute_step(0)
+        triton_eager_step(0)
+        cute_eager_step(0)
     torch.cuda.synchronize(device)
+
+    triton_graphs = []
+    cute_graphs = []
+    with torch.inference_mode():
+        for slot in pool:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch_reference(slot.inputs, slot.outputs, slot.reference_workspace)
+            triton_graphs.append(graph)
+        for slot in pool:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch_cute(forward, slot.inputs, slot.outputs)
+            cute_graphs.append(graph)
+    torch.cuda.synchronize(device)
+
+    def triton_step(iteration: int) -> None:
+        triton_graphs[iteration % len(triton_graphs)].replay()
+
+    def cute_step(iteration: int) -> None:
+        cute_graphs[iteration % len(cute_graphs)].replay()
 
     iterations = fixed_iters or _calibrated_iterations(
         (triton_step, cute_step), target_ms
@@ -498,7 +531,7 @@ def benchmark_shape(
         cute=cute_timing,
     )
 
-    del pool
+    del triton_graphs, cute_graphs, pool
     gc.collect()
     torch.cuda.empty_cache()
     return result
@@ -537,21 +570,28 @@ def _make_public_inputs(
     pair_bias = torch.randn(
         (
             shape.batch_size,
+            1,
             shape.num_heads,
             shape.context_length,
             shape.context_length,
         ),
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         device=device,
         generator=generator,
     )
     residual_mask = torch.empty(
-        (shape.batch_size, shape.num_sequences, shape.context_length),
-        dtype=torch.float32,
+        (
+            shape.batch_size,
+            shape.num_sequences,
+            1,
+            1,
+            shape.context_length,
+        ),
+        dtype=torch.bfloat16,
         device=device,
     )
-    residual_mask.bernoulli_(0.125, generator=generator).mul_(-1.0e9)
-    residual_mask[..., 0] = 0.0
+    residual_mask.bernoulli_(0.875, generator=generator)
+    residual_mask[..., 0] = 1.0
     return q, k, v, pair_bias, residual_mask, generator
 
 
@@ -566,14 +606,38 @@ def _make_triton_backward_slot(
     *,
     gradient_batch_capacity: int | None = None,
 ) -> TritonBackwardSlot:
-    q_public, k_public, v_public, pair_bias, residual_mask, generator = (
+    q_public, k_public, v_public, public_pair_bias, public_mask, generator = (
         _make_public_inputs(shape, device, seed)
     )
     public_shape = q_public.shape
     q, k, v = map(_to_triton_layout, (q_public, k_public, v_public))
+    pair_bias = public_pair_bias[:, 0]
+    residual_mask = (public_mask.float() - 1.0).mul_(1.0e9).reshape(
+        shape.batch_size, shape.num_sequences, shape.context_length
+    )
     inputs = EvoAttentionInputs(q, k, v, pair_bias, residual_mask)
-    forward = make_outputs(inputs)
-    launch_reference(inputs, forward)
+    forward = EvoAttentionOutputs(
+        output=torch.empty_like(q),
+        logsumexp=torch.empty(
+            (
+                shape.batch_size,
+                shape.num_sequences,
+                shape.num_heads,
+                shape.context_length,
+            ),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+    launch_reference_prepared(
+        q,
+        k,
+        v,
+        pair_bias,
+        residual_mask,
+        forward.output,
+        forward.logsumexp,
+    )
     output_gradient = _to_triton_layout(
         torch.randn(
             public_shape,
@@ -640,15 +704,39 @@ def _make_cute_backward_slot(
     q, k, v, pair_bias, residual_mask, generator = _make_public_inputs(
         shape, device, seed
     )
+    prepared_pair_bias = pair_bias[:, 0]
+    additive_mask = (residual_mask.float() - 1.0).mul_(1.0e9).reshape(
+        shape.batch_size, shape.num_sequences, shape.context_length
+    )
     internal_inputs = EvoAttentionInputs(
         _to_triton_layout(q),
         _to_triton_layout(k),
         _to_triton_layout(v),
-        pair_bias,
-        residual_mask,
+        prepared_pair_bias,
+        additive_mask,
     )
-    internal_forward = make_outputs(internal_inputs)
-    launch_reference(internal_inputs, internal_forward)
+    internal_forward = EvoAttentionOutputs(
+        output=torch.empty_like(internal_inputs.q),
+        logsumexp=torch.empty(
+            (
+                shape.batch_size,
+                shape.num_sequences,
+                shape.num_heads,
+                shape.context_length,
+            ),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+    launch_reference_prepared(
+        internal_inputs.q,
+        internal_inputs.k,
+        internal_inputs.v,
+        prepared_pair_bias,
+        additive_mask,
+        internal_forward.output,
+        internal_forward.logsumexp,
+    )
     output = internal_forward.output.transpose(2, 3).contiguous()
     logsumexp = internal_forward.logsumexp
     del internal_inputs, internal_forward
@@ -658,7 +746,7 @@ def _make_cute_backward_slot(
         device=device,
         generator=generator,
     )
-    pair_shape = pair_bias.shape
+    pair_shape = prepared_pair_bias.shape
     return CuteBackwardSlot(
         q=q,
         k=k,
@@ -687,10 +775,8 @@ def _make_cute_combined_slot(
 ) -> CuteCombinedSlot:
     """Prepare a true forward-to-backward CuTe dataflow without allocations.
 
-    The forward kernel consumes the prepared ``[B,S,H,N,D]`` layout, whereas
-    the backward kernel consumes ``[B,S,N,H,D]``. Both Q/K/V layouts are
-    prepared before timing. Only the required forward-output transpose remains
-    inside the measured collective.
+    Forward and backward consume the same MegaFold-facing Q/K/V, pair-bias,
+    and residual-mask tensors without an auxiliary conversion bridge.
 
     Backward output buffers are sized to one batch chunk and reused serially.
     This keeps the largest B=4/H=16/N=1024 collective below H100 memory limits
@@ -700,9 +786,9 @@ def _make_cute_combined_slot(
         shape, device, seed
     )
     forward_inputs = EvoAttentionInputs(
-        q=_to_triton_layout(q),
-        k=_to_triton_layout(k),
-        v=_to_triton_layout(v),
+        q=q,
+        k=k,
+        v=v,
         pair_bias=pair_bias,
         residual_mask=residual_mask,
     )
@@ -722,10 +808,9 @@ def _make_cute_combined_slot(
         shape.num_heads,
         shape.context_length,
     )
-    output_buffer = torch.empty(chunk_shape, dtype=torch.bfloat16, device=device)
-    query_gradient = torch.empty_like(output_buffer)
-    key_gradient = torch.empty_like(output_buffer)
-    value_gradient = torch.empty_like(output_buffer)
+    query_gradient = torch.empty(chunk_shape, dtype=torch.bfloat16, device=device)
+    key_gradient = torch.empty_like(query_gradient)
+    value_gradient = torch.empty_like(query_gradient)
     output_gradient = torch.randn(
         public_shape,
         dtype=torch.bfloat16,
@@ -746,14 +831,13 @@ def _make_cute_combined_slot(
         chunk_batch = stop - start
         chunks.append(
             CuteCombinedChunk(
-                forward_output=forward_outputs.output[start:stop],
                 q=q[start:stop],
                 k=k[start:stop],
                 v=v[start:stop],
-                output=output_buffer[:chunk_batch],
+                output=forward_outputs.output[start:stop],
                 output_gradient=output_gradient[start:stop],
-                pair_bias=pair_bias[start:stop],
-                residual_mask=residual_mask[start:stop],
+                pair_bias=forward_inputs.pair_bias[start:stop],
+                residual_mask=forward_inputs.residual_mask[start:stop],
                 logsumexp=forward_outputs.logsumexp[start:stop],
                 delta=delta[:chunk_batch],
                 query_gradient=query_gradient[:chunk_batch],
@@ -793,7 +877,8 @@ def _backward_slot_bytes(
         shape.batch_size * shape.num_heads * shape.context_length * shape.context_length
     )
     mask = shape.batch_size * shape.num_sequences * shape.context_length
-    slot_bytes = 16 * activation + 8 * row + 10 * pair + 4 * mask
+    mask_bytes = (4 if triton_reference else 2) * mask
+    slot_bytes = 16 * activation + 8 * row + 8 * pair + mask_bytes
     if triton_reference:
         slot_bytes += 6 * activation
     else:
@@ -835,19 +920,19 @@ def _cute_combined_slot_bytes(
     chunk_pair = pair * chunk_fraction_numerator // chunk_fraction_denominator
     mask = shape.batch_size * shape.num_sequences * shape.context_length
 
-    # Full-size buffers: public Q/K/V/dO and prepared forward Q/K/V/O.
-    full_activation_buffers = 8 * activation_bytes
-    # Reused chunk buffers: public O and dQ/dK/dV.
-    chunk_activation_buffers = 4 * chunk_activation_bytes
+    # Full-size public buffers: Q/K/V, forward output, and dO.
+    full_activation_buffers = 5 * activation_bytes
+    # Reused chunk buffers: dQ/dK/dV.
+    chunk_activation_buffers = 3 * chunk_activation_bytes
     # Backward's cached FP32 dQ accumulator is twice a BF16 activation buffer.
     backward_workspace = 2 * chunk_activation_bytes + 4 * chunk_row
     return (
         full_activation_buffers
         + chunk_activation_buffers
         + backward_workspace
-        + 4 * pair  # pair-bias input
+        + 2 * pair  # BF16 pair-bias input
         + 6 * chunk_pair  # FP32 accumulator and BF16 dPairBias
-        + 4 * mask  # residual mask
+        + 2 * mask  # BF16 residual mask
         + 4 * row  # forward LSE
         + 4 * chunk_row  # backward delta
     )
@@ -1050,7 +1135,16 @@ def _launch_cute_backward(backward: BackwardKernel, slot: CuteBackwardSlot) -> N
 
 def _launch_triton_combined(reference, slot: TritonBackwardSlot) -> None:
     """Launch a dependent reference forward and complete public backward."""
-    launch_reference(slot.buffers.inputs, slot.buffers.forward)
+    buffers = slot.buffers
+    launch_reference_prepared(
+        buffers.inputs.q,
+        buffers.inputs.k,
+        buffers.inputs.v,
+        buffers.inputs.pair_bias,
+        buffers.inputs.residual_mask,
+        buffers.forward.output,
+        buffers.forward.logsumexp,
+    )
     _launch_triton_public_backward(reference, slot)
 
 
@@ -1059,13 +1153,10 @@ def _launch_cute_combined(
     backward: BackwardKernel,
     slot: CuteCombinedSlot,
 ) -> None:
-    """Launch forward, bridge its output layout, then launch full backward."""
+    """Launch a dependent model-layout forward and complete backward."""
     launch_cute(forward, slot.forward_inputs, slot.forward_outputs)
     stream = torch.cuda.current_stream(slot.forward_outputs.output.device)
     for chunk in slot.backward_chunks:
-        # Forward writes [B,S,H,N,D], while backward consumes [B,S,N,H,D].
-        # This is the only layout operation required between the two CuTe APIs.
-        chunk.output.copy_(chunk.forward_output.transpose(2, 3))
         backward(
             chunk.q,
             chunk.k,
@@ -1366,8 +1457,10 @@ def _write_json(
         "head_dimension": args.head_dim,
         "required_speedup": args.required_speedup,
         "timing": (
-            "CUDA events, prepared-layout kernel only, median of repeat "
-            "averages, rotating address pool"
+            "CUDA-event timing of CUDA-graph replay from MegaFold-layout inputs "
+            "to MegaFold-layout output; Triton includes mask conversion and "
+            "Q/K/V/output layout copies; allocation, compilation, capture, and "
+            "warmup excluded; median of repeat averages with rotating addresses"
         ),
         "results": serialized_results,
     }
@@ -1396,7 +1489,7 @@ def _write_backward_json(
         "required_speedup": args.required_speedup,
         "compile_count": compile_count,
         "timing": (
-            "CUDA events, prepared model layouts, all backward launches and "
+            "CUDA events, MegaFold-layout inputs, all backward launches and "
             "output conversions, median of repeat averages, matched rotating "
             "pool and iteration count"
         ),
@@ -1440,10 +1533,10 @@ def _write_combined_json(
         "timing": (
             "CUDA-event timing of dependent forward plus complete backward; "
             f"execution={execution}; "
-            "prepared input layouts, allocation, compilation, graph capture, and "
-            "warmup excluded; required CuTe "
-            "forward-output layout bridge and Triton gradient output conversions "
-            "included; matched rotating address pool, iteration count, and "
+            "preallocated input layouts, allocation, compilation, graph capture, "
+            "and warmup excluded; CuTe forward and backward share the model "
+            "layout without a bridge; Triton gradient output conversions included; "
+            "matched rotating address pool, iteration count, and "
             "backward batch chunk"
         ),
         "results": serialized_results,
@@ -1638,14 +1731,20 @@ def main() -> None:
     print(f"head dimension: {args.head_dim}")
     if args.direction == "combined":
         print(
-            "timing: dependent forward + complete backward, prepared inputs, "
+            "timing: dependent forward + complete backward, preallocated inputs, "
             f"{'eager launches' if args.eager_combined else 'CUDA-graph replay'}, "
             "CUDA events, compile/allocation/warmup excluded"
         )
+    elif args.direction == "backward":
+        print(
+            "timing: MegaFold-layout complete backward, CUDA events, "
+            "compile/allocation/warmup excluded"
+        )
     else:
         print(
-            "timing: prepared-layout kernel only, CUDA events, "
-            "compile/warmup excluded"
+            "timing: MegaFold-layout inputs/output, CUDA-graph replay and CUDA "
+            "events; Triton mask/layout preparation included; "
+            "compile/allocation/capture/warmup excluded"
         )
     print(f"required speedup: {args.required_speedup:.3f}x on every selected shape\n")
 

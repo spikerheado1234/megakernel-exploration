@@ -1,10 +1,11 @@
 """CuTe-DSL EvoAttention backward for NVIDIA Hopper.
 
-Prepared tensor contract:
+Model-facing tensor contract:
 
 * q/k/v/output/output_gradient and dQ/dK/dV: ``[B, S, N, H, 32]`` BF16
-* pair bias and its accumulator: ``[B, H, N, N]`` FP32
-* residual mask: ``[B, S, N]`` FP32 containing ``0`` or ``-1e9``
+* pair bias: ``[B, 1, H, N, N]`` BF16
+* residual mask: ``[B, S, 1, 1, N]`` BF16 containing ``0`` or ``1``
+* pair-bias accumulator: ``[B, H, N, N]`` FP32
 * logsumexp and delta workspace: ``[B, S, H, N]`` FP32
 * final pair-bias gradient: ``[B, H, N, N]`` BF16
 
@@ -70,8 +71,8 @@ ACTIVATION_TILE_BYTES = QUERY_TILE_SIZE * HEAD_DIMENSION * 2
 KEY_VALUE_TILE_BYTES = KEY_TILE_SIZE * HEAD_DIMENSION * 2
 STATISTIC_TILE_BYTES = QUERY_TILE_SIZE * 4
 QUERY_GRADIENT_TILE_BYTES = QUERY_TILE_SIZE * HEAD_DIMENSION * 4
-PAIR_BIAS_TILE_BYTES = QUERY_TILE_SIZE * KEY_TILE_SIZE * 4
-RESIDUAL_MASK_TILE_BYTES = KEY_TILE_SIZE * 4
+PAIR_BIAS_TILE_BYTES = QUERY_TILE_SIZE * KEY_TILE_SIZE * 2
+RESIDUAL_MASK_TILE_BYTES = KEY_TILE_SIZE * 2
 PAIR_BIAS_EVICT_LAST_POLICY = 0x14F0000000000000
 
 
@@ -821,7 +822,7 @@ class _EvoAttentionBackwardMain:
         )
         pair_bias_layout_atom = warpgroup.make_smem_layout_atom(
             SmemLayoutAtomKind.MN_SW128,
-            Float32,
+            self.dtype,
         )
         self.sPairBias_layout = cute.tile_to_shape(
             pair_bias_layout_atom,
@@ -915,11 +916,11 @@ class _EvoAttentionBackwardMain:
             sdO: sdO_struct
             sdS: cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sdS], 1024]
             sPairBias: cute.struct.Align[
-                cute.struct.MemRange[Float32, cute.cosize(self.sPairBias_layout)],
+                cute.struct.MemRange[self.dtype, cute.cosize(self.sPairBias_layout)],
                 1024,
             ]
             sResidualMask: cute.struct.Align[
-                cute.struct.MemRange[Float32, self.tile_n], 128
+                cute.struct.MemRange[self.dtype, self.tile_n], 128
             ]
             sdQaccum: sdQaccum_struct
 
@@ -950,8 +951,8 @@ class _EvoAttentionBackwardMain:
                 t, [1, 3, 2, 0] if cute.rank(t.shape) == 4 else [0, 2, 1]
             )
 
-        pair_bias_view = _layout_select(pair_bias, [3, 2, 1, 0])
-        residual_mask_view = _layout_select(residual_mask, [2, 1, 0])
+        pair_bias_view = _layout_select(pair_bias, [4, 3, 2, 0])
+        residual_mask_view = _layout_select(residual_mask, [4, 1, 0])
         mQ, mK, mV, mdO = [_qkv_transpose(t) for t in (mQ, mK, mV, mdO)]
         mdQ, mdK, mdV = [_qkv_transpose(t) for t in (mdQ, mdK, mdV)]
         LSE_dPsum_dQaccum_transpose = (
@@ -1480,12 +1481,16 @@ class _EvoAttentionBackwardMain:
             query_idx = coordinates[element][1]
             scores[element] = (
                 scores[element] * softmax_scale
-                + shared_pair_bias[
+                + Float32(shared_pair_bias[
                     key_idx - key_block * self.tile_n,
                     query_idx - query_block * self.tile_m,
                     stage,
-                ]
-                + shared_residual_mask[key_idx - key_block * self.tile_n]
+                ])
+                + (
+                    Float32(shared_residual_mask[key_idx - key_block * self.tile_n])
+                    - 1.0
+                )
+                * 1.0e9
             )
 
     @cute.jit
@@ -2212,8 +2217,8 @@ def _split_sequence_pair_bias_gradient_kernel(
     thread_idx, _, _ = cute.arch.thread_idx()
     pair_tile_idx, batch_head_idx, sequence_chunk_idx = cute.arch.block_idx()
 
-    context_length = pair_bias.shape[2]
-    head_count = pair_bias.shape[1]
+    context_length = pair_bias.shape[3]
+    head_count = pair_bias.shape[2]
     sequence_count = residual_mask.shape[1]
     key_block_count = context_length // KEY_TILE_SIZE
     query_block_idx = pair_tile_idx // key_block_count
@@ -2237,7 +2242,7 @@ def _split_sequence_pair_bias_gradient_kernel(
         cutlass.BFloat16, key_layout.outer, swizzle=key_layout.inner
     )
     shared_mask = allocator.allocate_tensor(
-        cutlass.Float32,
+        cutlass.BFloat16,
         cute.make_layout((KEY_TILE_SIZE, 2), stride=(1, KEY_TILE_SIZE)),
     )
     shared_lse = allocator.allocate_tensor(
@@ -2310,9 +2315,9 @@ def _split_sequence_pair_bias_gradient_kernel(
     )
     for element_idx in cutlass.range_constexpr(cute.size(pair_bias_fragment)):
         row, column = score_coordinates[element_idx]
-        pair_bias_fragment[element_idx] = pair_bias[
-            batch_idx, head_idx, query_base + row, key_base + column
-        ]
+        pair_bias_fragment[element_idx] = Float32(
+            pair_bias[batch_idx, 0, head_idx, query_base + row, key_base + column]
+        )
     gradient_sum = score_mma.make_fragment_C(
         score_mma.partition_shape_C((QUERY_TILE_SIZE, KEY_TILE_SIZE))
     )
@@ -2367,7 +2372,7 @@ def _split_sequence_pair_bias_gradient_kernel(
         )
     if thread_idx < KEY_TILE_SIZE:
         shared_mask[thread_idx, 0] = residual_mask[
-            batch_idx, sequence, key_base + thread_idx
+            batch_idx, sequence, 0, 0, key_base + thread_idx
         ]
     if thread_idx < QUERY_TILE_SIZE:
         shared_lse[thread_idx, 0] = logsumexp[
@@ -2431,7 +2436,7 @@ def _split_sequence_pair_bias_gradient_kernel(
                 )
             if thread_idx < KEY_TILE_SIZE:
                 shared_mask[thread_idx, next_stage] = residual_mask[
-                    batch_idx, next_sequence, key_base + thread_idx
+                    batch_idx, next_sequence, 0, 0, key_base + thread_idx
                 ]
             if thread_idx < QUERY_TILE_SIZE:
                 shared_lse[thread_idx, next_stage] = logsumexp[
@@ -2469,7 +2474,7 @@ def _split_sequence_pair_bias_gradient_kernel(
             probability = cute.math.exp(
                 score[element_idx] * SOFTMAX_SCALE
                 + pair_bias_fragment[element_idx]
-                + shared_mask[column, stage]
+                + (Float32(shared_mask[column, stage]) - 1.0) * 1.0e9
                 - shared_lse[row, stage],
                 fastmath=True,
             )
@@ -2564,7 +2569,7 @@ def _launch_split_sequence_pair_bias_gradient(
         atom_layout_mnk=(1, 2, 1),
         tiler_mn=(QUERY_TILE_SIZE, KEY_TILE_SIZE // 2),
     )
-    context_length = pair_bias.shape[2]
+    context_length = pair_bias.shape[3]
     pair_tile_count = (context_length // QUERY_TILE_SIZE) * (
         context_length // KEY_TILE_SIZE
     )
@@ -2588,7 +2593,7 @@ def _launch_split_sequence_pair_bias_gradient(
     ).launch(
         grid=(
             pair_tile_count,
-            pair_bias.shape[0] * pair_bias.shape[1],
+            pair_bias.shape[0] * pair_bias.shape[2],
             residual_mask.shape[1] // SPLIT_SEQUENCE_CHUNK_SIZE,
         ),
         block=(SPLIT_PAIR_BIAS_THREADS, 1, 1),
@@ -2640,7 +2645,7 @@ class _BackwardLaunch:
             1,
             1,
         )
-        if pair_bias.shape[2] == KEY_TILE_SIZE:
+        if pair_bias.shape[3] == KEY_TILE_SIZE:
             _launch_backward_preprocess(
                 output,
                 output_gradient,
@@ -2659,7 +2664,7 @@ class _BackwardLaunch:
                 stream,
             )
 
-        if pair_bias.shape[1] == 16 and pair_bias.shape[2] >= 640:
+        if pair_bias.shape[2] == 16 and pair_bias.shape[3] >= 640:
             self.main(
                 q,
                 k,
@@ -2710,7 +2715,7 @@ class _BackwardLaunch:
                 stream,
             )
 
-        if pair_bias.shape[2] == KEY_TILE_SIZE:
+        if pair_bias.shape[3] == KEY_TILE_SIZE:
             _convert_fp32_to_bf16(
                 pair_bias_gradient_flat,
                 pair_bias_gradient_output_flat,
@@ -2742,6 +2747,13 @@ def _dynamic_tensor(
             divisibility=divisibility,
         )
     return result
+
+
+def _dynamic_layout_tensor(tensor: torch.Tensor, leading_dim: int) -> cute.Tensor:
+    """Preserve runtime strides for a tensor with one contiguous leading mode."""
+    return from_dlpack(
+        tensor.detach(), assumed_align=16, enable_tvm_ffi=True
+    ).mark_layout_dynamic(leading_dim=leading_dim)
 
 
 class EvoAttentionBackward:
@@ -2800,8 +2812,11 @@ class EvoAttentionBackward:
                 "all activation and gradient tensors must match q and be BF16"
             )
         pair_shape = (batch, heads, context_length, context_length)
-        if pair_bias.shape != pair_shape or pair_bias.dtype != torch.float32:
-            raise ValueError("pair_bias must be FP32 [B, H, N, N]")
+        if (
+            pair_bias.shape != (batch, 1, heads, context_length, context_length)
+            or pair_bias.dtype != torch.bfloat16
+        ):
+            raise ValueError("pair_bias must be BF16 [B, 1, H, N, N]")
         if (
             pair_bias_gradient.shape != pair_shape
             or pair_bias_gradient.dtype != torch.float32
@@ -2813,10 +2828,10 @@ class EvoAttentionBackward:
         ):
             raise ValueError("pair_bias_gradient_output must be BF16 [B, H, N, N]")
         if (
-            residual_mask.shape != (batch, sequence_count, context_length)
-            or residual_mask.dtype != torch.float32
+            residual_mask.shape != (batch, sequence_count, 1, 1, context_length)
+            or residual_mask.dtype != torch.bfloat16
         ):
-            raise ValueError("residual_mask must be FP32 [B, S, N]")
+            raise ValueError("residual_mask must be BF16 [B, S, 1, 1, N]")
         statistics_shape = (batch, sequence_count, heads, context_length)
         if (
             logsumexp.shape != statistics_shape
@@ -2833,8 +2848,20 @@ class EvoAttentionBackward:
             pair_bias_gradient,
             pair_bias_gradient_output,
         )
-        if any(not tensor.is_cuda or not tensor.is_contiguous() for tensor in tensors):
-            raise ValueError("all tensors must be contiguous CUDA tensors")
+        compact_tensors = tuple(
+            tensor for tensor in tensors if tensor is not pair_bias
+        )
+        if any(
+            not tensor.is_cuda or not tensor.is_contiguous()
+            for tensor in compact_tensors
+        ):
+            raise ValueError("all tensors except pair_bias must be contiguous CUDA tensors")
+        if not pair_bias.is_cuda:
+            raise ValueError("pair_bias must be a CUDA tensor")
+        if pair_bias.stride(-1) != 1 or any(
+            stride < 0 for stride in pair_bias.stride()
+        ):
+            raise ValueError("pair_bias must have a positive-stride contiguous K axis")
         if any(tensor.device != q.device for tensor in tensors):
             raise ValueError("all tensors must reside on the same CUDA device")
         return batch, sequence_count, context_length, heads
@@ -2887,22 +2914,26 @@ class EvoAttentionBackward:
         activation_divisibility = (128, 128, 4)
         statistic_divisibility = (128, 4, 128)
         pair_divisibility = (1, 4, 128, 128)
-        mask_divisibility = (1, 128, 128)
-        dynamic_divisibilities = (
-            *(activation_divisibility,) * 5,
-            *(statistic_divisibility,) * 3,
-            *(activation_divisibility,) * 3,
-            pair_divisibility,
-            mask_divisibility,
-            pair_divisibility,
-            pair_divisibility,
+        mask_divisibility = (1, 128, 1, 1, 128)
+        compile_arguments = (
+            *(
+                _dynamic_tensor(tensor, activation_divisibility)
+                for tensor in tensors[:5]
+            ),
+            *(
+                _dynamic_tensor(tensor, statistic_divisibility)
+                for tensor in tensors[5:8]
+            ),
+            *(
+                _dynamic_tensor(tensor, activation_divisibility)
+                for tensor in tensors[8:11]
+            ),
+            _dynamic_layout_tensor(tensors[11], leading_dim=4),
+            _dynamic_tensor(tensors[12], mask_divisibility),
+            _dynamic_tensor(tensors[13], pair_divisibility),
+            _dynamic_tensor(tensors[14], pair_divisibility),
+            cuda_stream,
         )
-        compile_arguments = tuple(
-            _dynamic_tensor(tensor, divisibilities)
-            for tensor, divisibilities in zip(
-                tensors, dynamic_divisibilities, strict=True
-            )
-        ) + (cuda_stream,)
         return CompileCallable((PtxasOptions("--maxrregcount=255"), EnableTVMFFI))(
             _BackwardLaunch(),
             *compile_arguments,

@@ -1,16 +1,16 @@
 """Fused EvoAttention forward kernel for NVIDIA Hopper.
 
 The public entry point, :func:`get_evoattention_forward`, returns a cached
-TVM-FFI callable. It accepts prepared contiguous tensors with this contract:
+TVM-FFI callable. It accepts tensors in MegaFold's model-facing contract:
 
-- query/key/value/output: ``[B, S, H, N, 32]`` BF16
-- pair bias: ``[B, H, N, N]`` FP32
-- residual mask: ``[B, S, N]`` FP32 containing ``0`` or ``-1e9``
+- query/key/value/output: ``[B, S, N, H, 32]`` BF16
+- pair bias: ``[B, 1, H, N, N]`` BF16
+- residual mask: ``[B, S, 1, 1, N]`` BF16 containing ``0`` or ``1``
 - log-sum-exp: ``[B, S, H, N]`` FP32
 
 The implementation uses one TMA producer warp and two 128-thread WGMMA
 consumer warpgroups. The consumers process the same M=64 query rows for two
-adjacent sequences, sharing the FP32 pair-bias tile while keeping independent
+adjacent sequences, sharing the BF16 pair-bias tile while keeping independent
 Q/K/V, residual-mask, output, and softmax state. B, S, H, and N remain runtime
 dynamic, while D=32 and the tile schedule are static.
 """
@@ -76,6 +76,20 @@ def _as_dynamic_tensor(
     return dynamic_tensor
 
 
+def _as_dynamic_layout_tensor(
+    tensor: torch.Tensor,
+    *,
+    alignment: int,
+    leading_dim: int,
+) -> cute.Tensor:
+    """Preserve a runtime-strided flat layout with one known unit stride."""
+    return from_dlpack(
+        tensor.detach(),
+        assumed_align=alignment,
+        enable_tvm_ffi=True,
+    ).mark_layout_dynamic(leading_dim=leading_dim)
+
+
 @cute.kernel
 def _evoattention_forward_kernel(
     q: cute.Tensor,
@@ -90,9 +104,6 @@ def _evoattention_forward_kernel(
     residual_mask_tensor: cute.Tensor,
     output_tma: cute.CopyAtom,
     output_tensor: cute.Tensor,
-    pair_bias: cute.Tensor,
-    residual_mask: cute.Tensor,
-    out: cute.Tensor,
     lse: cute.Tensor,
     query_layout: cute.ComposedLayout,
     key_layout: cute.ComposedLayout,
@@ -112,27 +123,19 @@ def _evoattention_forward_kernel(
     thread_idx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.warp_idx()
     linear_block, _, _ = cute.arch.block_idx()
-    n_ctx = out.shape[1]
+    n_ctx = q.shape[0]
+    heads = q.shape[2]
+    sequence_count = q.shape[3]
+    batch = q.shape[4]
     query_blocks = n_ctx // QUERY_TILE_SIZE
-    problem_count = out.shape[0]
-
-    batch_heads = pair_bias.shape[0]
-    batch_sequences = residual_mask.shape[0]
-    batch = (batch_heads * batch_sequences) // problem_count
-    heads = batch_heads // batch
-    sequence_count = batch_sequences // batch
     sequence_pairs = sequence_count // CONSUMER_WARPGROUP_COUNT
     query_block = linear_block % query_blocks
     sequence_pair_linear = linear_block // query_blocks
     sequence_pair = sequence_pair_linear % sequence_pairs
-    pair_bias_idx = sequence_pair_linear // sequence_pairs
-    batch_idx = pair_bias_idx // heads
-    head_idx = pair_bias_idx % heads
+    batch_head_idx = sequence_pair_linear // sequence_pairs
+    batch_idx = batch_head_idx // heads
+    head_idx = batch_head_idx % heads
     sequence_0 = sequence_pair * CONSUMER_WARPGROUP_COUNT
-    batch_seq_idx_0 = batch_idx * sequence_count + sequence_0
-    batch_seq_idx_1 = batch_seq_idx_0 + 1
-    problem_idx_0 = batch_seq_idx_0 * heads + head_idx
-    problem_idx_1 = batch_seq_idx_1 * heads + head_idx
 
     allocator = cutlass.utils.SmemAllocator()
     shared_query = allocator.allocate_tensor(
@@ -142,7 +145,7 @@ def _evoattention_forward_kernel(
         cutlass.BFloat16, key_layout.outer, swizzle=key_layout.inner
     )
     shared_pair_bias = allocator.allocate_tensor(
-        cutlass.Float32,
+        cutlass.BFloat16,
         pair_bias_layout.outer,
         swizzle=pair_bias_layout.inner,
     )
@@ -150,7 +153,7 @@ def _evoattention_forward_kernel(
         cutlass.BFloat16, value_layout.outer, swizzle=value_layout.inner
     )
     shared_mask = allocator.allocate_tensor(
-        cutlass.Float32,
+        cutlass.BFloat16,
         cute.make_layout(
             (KEY_TILE_SIZE, CONSUMER_WARPGROUP_COUNT * KEY_VALUE_STAGES),
             stride=(1, KEY_TILE_SIZE),
@@ -212,8 +215,12 @@ def _evoattention_forward_kernel(
     cute.arch.sync_threads()
 
     query_tiles = cute.zipped_divide(q, (QUERY_TILE_SIZE, HEAD_DIMENSION))
-    query_problem_0 = query_tiles[None, (None, 0, problem_idx_0)]
-    query_problem_1 = query_tiles[None, (None, 0, problem_idx_1)]
+    query_problem_0 = query_tiles[
+        None, (None, 0, head_idx, sequence_0, batch_idx)
+    ]
+    query_problem_1 = query_tiles[
+        None, (None, 0, head_idx, sequence_0 + 1, batch_idx)
+    ]
     shared_query_partition, global_query_partition_0 = cute.nvgpu.cpasync.tma_partition(
         query_tma,
         0,
@@ -229,8 +236,10 @@ def _evoattention_forward_kernel(
         query_problem_1,
     )
     key_tiles = cute.zipped_divide(k, (KEY_TILE_SIZE, HEAD_DIMENSION))
-    key_problem_0 = key_tiles[None, (None, 0, problem_idx_0)]
-    key_problem_1 = key_tiles[None, (None, 0, problem_idx_1)]
+    key_problem_0 = key_tiles[None, (None, 0, head_idx, sequence_0, batch_idx)]
+    key_problem_1 = key_tiles[
+        None, (None, 0, head_idx, sequence_0 + 1, batch_idx)
+    ]
     shared_key_partition, global_key_partition_0 = cute.nvgpu.cpasync.tma_partition(
         key_tma,
         0,
@@ -246,8 +255,10 @@ def _evoattention_forward_kernel(
         key_problem_1,
     )
     value_tiles = cute.zipped_divide(v, (HEAD_DIMENSION, KEY_TILE_SIZE))
-    value_problem_0 = value_tiles[None, (0, None, problem_idx_0)]
-    value_problem_1 = value_tiles[None, (0, None, problem_idx_1)]
+    value_problem_0 = value_tiles[None, (0, None, head_idx, sequence_0, batch_idx)]
+    value_problem_1 = value_tiles[
+        None, (0, None, head_idx, sequence_0 + 1, batch_idx)
+    ]
     shared_value_partition, global_value_partition_0 = cute.nvgpu.cpasync.tma_partition(
         value_tma,
         0,
@@ -265,7 +276,9 @@ def _evoattention_forward_kernel(
     pair_bias_tiles = cute.zipped_divide(
         pair_bias_tensor, (KEY_TILE_SIZE, QUERY_TILE_SIZE)
     )
-    pair_bias_problem = pair_bias_tiles[None, (None, None, pair_bias_idx)]
+    pair_bias_problem = pair_bias_tiles[
+        None, (None, None, head_idx, batch_idx)
+    ]
     shared_pair_bias_partition, global_pair_bias_partition = (
         cute.nvgpu.cpasync.tma_partition(
             pair_bias_tma,
@@ -276,8 +289,12 @@ def _evoattention_forward_kernel(
         )
     )
     residual_mask_tiles = cute.zipped_divide(residual_mask_tensor, (KEY_TILE_SIZE,))
-    residual_mask_problem_0 = residual_mask_tiles[None, (None, batch_seq_idx_0)]
-    residual_mask_problem_1 = residual_mask_tiles[None, (None, batch_seq_idx_1)]
+    residual_mask_problem_0 = residual_mask_tiles[
+        None, (None, sequence_0, batch_idx)
+    ]
+    residual_mask_problem_1 = residual_mask_tiles[
+        None, (None, sequence_0 + 1, batch_idx)
+    ]
     shared_mask_partition, global_mask_partition_0 = cute.nvgpu.cpasync.tma_partition(
         residual_mask_tma,
         0,
@@ -295,8 +312,12 @@ def _evoattention_forward_kernel(
     output_tiles = cute.zipped_divide(
         output_tensor, (HEAD_DIMENSION, QUERY_TILE_SIZE)
     )
-    output_problem_0 = output_tiles[None, (0, None, problem_idx_0)]
-    output_problem_1 = output_tiles[None, (0, None, problem_idx_1)]
+    output_problem_0 = output_tiles[
+        None, (0, None, head_idx, sequence_0, batch_idx)
+    ]
+    output_problem_1 = output_tiles[
+        None, (0, None, head_idx, sequence_0 + 1, batch_idx)
+    ]
     shared_output_0 = cute.local_tile(
         shared_output, (HEAD_DIMENSION, QUERY_TILE_SIZE), (0, 0)
     )
@@ -367,12 +388,12 @@ def _evoattention_forward_kernel(
                     CONSUMER_WARPGROUP_COUNT
                     * (
                         2 * KEY_TILE_SIZE * HEAD_DIMENSION * 2
-                        + KEY_TILE_SIZE * 4
+                        + KEY_TILE_SIZE * 2
                     ),
                 )
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     pair_bias_ready + pair_bias_stage,
-                    QUERY_TILE_SIZE * KEY_TILE_SIZE * 4,
+                    QUERY_TILE_SIZE * KEY_TILE_SIZE * 2,
                 )
             cute.copy(
                 key_tma,
@@ -440,10 +461,6 @@ def _evoattention_forward_kernel(
         consumer_warpgroup = thread_idx // THREADS_PER_WARPGROUP
         warpgroup_thread_idx = thread_idx - consumer_warpgroup * THREADS_PER_WARPGROUP
         query_base = query_block * QUERY_TILE_SIZE
-        consumer_problem_idx = problem_idx_0
-        if consumer_warpgroup == 1:
-            consumer_problem_idx = problem_idx_1
-
         cute.arch.mbarrier_wait(query_ready + consumer_warpgroup, 0)
         qk_thread = score_mma.get_slice(warpgroup_thread_idx)
         query_fragment = score_mma.make_fragment_A(qk_thread.partition_A(shared_query))
@@ -559,8 +576,18 @@ def _evoattention_forward_kernel(
                 elem_3 = elem_0 + 3
                 _, col_0 = score_coords[elem_0]
                 _, col_1 = score_coords[elem_1]
-                mask_0 = shared_broadcast_mask[0, col_0, key_value_slot]
-                mask_1 = shared_broadcast_mask[0, col_1, key_value_slot]
+                mask_0 = (
+                    cutlass.Float32(
+                        shared_broadcast_mask[0, col_0, key_value_slot]
+                    )
+                    - 1.0
+                ) * 1.0e9
+                mask_1 = (
+                    cutlass.Float32(
+                        shared_broadcast_mask[0, col_1, key_value_slot]
+                    )
+                    - 1.0
+                ) * 1.0e9
                 score_0 = (
                     score_fragment[elem_0] * SOFTMAX_SCALE
                     + pair_bias_fragment[elem_0]
@@ -674,12 +701,13 @@ def _evoattention_forward_kernel(
         output_retile = output_register_copy.retile(output_bf16)
         cute.copy(output_register_copy, output_retile, output_partition)
         if warpgroup_thread_idx % 4 == 0:
-            lse[consumer_problem_idx, query_base + first_row] = running_max_0 + cute.math.log(
-                running_sum_0, fastmath=True
-            )
-            lse[consumer_problem_idx, query_base + second_row] = running_max_1 + cute.math.log(
-                running_sum_1, fastmath=True
-            )
+            sequence_idx = sequence_0 + consumer_warpgroup
+            lse[
+                query_base + first_row, head_idx, sequence_idx, batch_idx
+            ] = running_max_0 + cute.math.log(running_sum_0, fastmath=True)
+            lse[
+                query_base + second_row, head_idx, sequence_idx, batch_idx
+            ] = running_max_1 + cute.math.log(running_sum_1, fastmath=True)
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.barrier(
             barrier_id=OUTPUT_READY_BARRIER_ID,
@@ -711,8 +739,11 @@ def _build_and_launch_forward(
     lse: cute.Tensor,
     stream: cuda.CUstream,
 ):
-    problem_count = q.shape[0]
-    n_ctx = q.shape[1]
+    batch = q.shape[0]
+    sequence_count = q.shape[1]
+    n_ctx = q.shape[2]
+    heads = q.shape[3]
+    problem_count = batch * sequence_count * heads
 
     score_mma = sm90_utils.make_trivial_tiled_mma(
         cutlass.BFloat16,
@@ -761,19 +792,28 @@ def _build_and_launch_forward(
         num_stages=CONSUMER_WARPGROUP_COUNT * KEY_VALUE_STAGES,
     )
 
-    query_view = cute.make_tensor(q.iterator, cute.select(q.layout, mode=[1, 2, 0]))
-    key_view = cute.make_tensor(k.iterator, cute.select(k.layout, mode=[1, 2, 0]))
-    value_view = cute.make_tensor(v.iterator, cute.select(v.layout, mode=[2, 1, 0]))
+    query_view = cute.make_tensor(
+        q.iterator, cute.select(q.layout, mode=[2, 4, 3, 1, 0])
+    )
+    key_view = cute.make_tensor(
+        k.iterator, cute.select(k.layout, mode=[2, 4, 3, 1, 0])
+    )
+    value_view = cute.make_tensor(
+        v.iterator, cute.select(v.layout, mode=[4, 2, 3, 1, 0])
+    )
     pair_bias_view = cute.make_tensor(
         pair_bias.iterator,
-        cute.select(pair_bias.layout, mode=[2, 1, 0]),
+        cute.select(pair_bias.layout, mode=[4, 3, 2, 0]),
     )
     residual_mask_view = cute.make_tensor(
         residual_mask.iterator,
-        cute.select(residual_mask.layout, mode=[1, 0]),
+        cute.select(residual_mask.layout, mode=[4, 1, 0]),
     )
     output_view = cute.make_tensor(
-        out.iterator, cute.select(out.layout, mode=[2, 1, 0])
+        out.iterator, cute.select(out.layout, mode=[4, 2, 3, 1, 0])
+    )
+    lse_view = cute.make_tensor(
+        lse.iterator, cute.select(lse.layout, mode=[3, 2, 1, 0])
     )
     load_tma_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
     query_tma_layout = sm90_utils.make_smem_layout_a(
@@ -796,7 +836,7 @@ def _build_and_launch_forward(
     )
     pair_bias_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
         SmemLayoutAtomKind.MN_SW128,
-        cutlass.Float32,
+        cutlass.BFloat16,
     )
     pair_bias_layout = cute.tile_to_shape(
         pair_bias_layout_atom,
@@ -876,10 +916,7 @@ def _build_and_launch_forward(
         residual_mask_tensor,
         output_tma,
         output_tensor,
-        pair_bias,
-        residual_mask,
-        out,
-        lse,
+        lse_view,
         query_layout,
         key_layout,
         value_layout,
@@ -928,9 +965,9 @@ class EvoAttentionForward:
     ) -> None:
         if q.ndim != 5:
             raise ValueError(
-                f"q must have shape [B, S, H, N, 32], got {tuple(q.shape)}"
+                f"q must have shape [B, S, N, H, 32], got {tuple(q.shape)}"
             )
-        batch, sequence_count, heads, n_ctx, dim = q.shape
+        batch, sequence_count, n_ctx, heads, dim = q.shape
         if sequence_count != n_ctx:
             raise ValueError(
                 f"this forward requires S=N, got S={sequence_count}, N={n_ctx}"
@@ -945,14 +982,14 @@ class EvoAttentionForward:
             raise ValueError("S must be even so the two consumers can pair sequences")
         if k.shape != q.shape or v.shape != q.shape or out.shape != q.shape:
             raise ValueError("q, k, v and out must have identical shapes")
-        if tuple(pair_bias.shape) != (batch, heads, n_ctx, n_ctx):
+        if tuple(pair_bias.shape) != (batch, 1, heads, n_ctx, n_ctx):
             raise ValueError(
-                "pair_bias must have shape [B, H, N, N], got "
+                "pair_bias must have shape [B, 1, H, N, N], got "
                 f"{tuple(pair_bias.shape)}"
             )
-        if tuple(residual_mask.shape) != (batch, sequence_count, n_ctx):
+        if tuple(residual_mask.shape) != (batch, sequence_count, 1, 1, n_ctx):
             raise ValueError(
-                "residual_mask must have shape [B, S, N], got "
+                "residual_mask must have shape [B, S, 1, 1, N], got "
                 f"{tuple(residual_mask.shape)}"
             )
         if tuple(lse.shape) != (batch, sequence_count, heads, n_ctx):
@@ -965,53 +1002,36 @@ class EvoAttentionForward:
             raise ValueError("all tensors must be on the same CUDA device")
         if q.device.type != "cuda":
             raise ValueError("EvoAttention requires CUDA tensors")
-        if any(not t.is_contiguous() for t in tensors):
-            raise ValueError("all prepared tensors must be contiguous")
+        compact_tensors = (q, k, v, residual_mask, out, lse)
+        if any(not tensor.is_contiguous() for tensor in compact_tensors):
+            raise ValueError("Q/K/V/mask/output/LSE tensors must be contiguous")
+        if pair_bias.stride(-1) != 1 or any(stride < 0 for stride in pair_bias.stride()):
+            raise ValueError("pair_bias must have a positive-stride contiguous K axis")
         if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
             raise TypeError("q, k and v must be bfloat16")
         if out.dtype != torch.bfloat16:
             raise TypeError("out must be bfloat16")
-        if pair_bias.dtype != torch.float32 or residual_mask.dtype != torch.float32:
-            raise TypeError("pair_bias and residual_mask must be float32")
+        if pair_bias.dtype != torch.bfloat16 or residual_mask.dtype != torch.bfloat16:
+            raise TypeError("pair_bias and residual_mask must be bfloat16")
         if lse.dtype != torch.float32:
             raise TypeError("lse must be float32")
 
     @staticmethod
-    def _make_runtime_views(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        pair_bias: torch.Tensor,
-        residual_mask: torch.Tensor,
-        out: torch.Tensor,
-        lse: torch.Tensor,
-    ) -> tuple[torch.Tensor, ...]:
-        batch, sequence_count, heads, n_ctx, dim = q.shape
-        problems = batch * sequence_count * heads
-        return (
-            q.view(problems, n_ctx, dim),
-            k.view(problems, n_ctx, dim),
-            v.view(problems, n_ctx, dim),
-            pair_bias.view(batch * heads, n_ctx, n_ctx),
-            residual_mask.view(batch * sequence_count, n_ctx),
-            out.view(problems, n_ctx, dim),
-            lse.view(problems, n_ctx),
-        )
-
-    @staticmethod
     def _make_compile_arguments(
-        views: tuple[torch.Tensor, ...],
+        arguments: tuple[torch.Tensor, ...],
         stream: cuda.CUstream,
     ) -> tuple[object, ...]:
-        q, k, v, pair_bias, residual_mask, out, lse = views
+        q, k, v, pair_bias, residual_mask, out, lse = arguments
         return (
-            _as_dynamic_tensor(q, (0, 1), alignment=16, tiled_modes=(1,)),
-            _as_dynamic_tensor(k, (0, 1), alignment=16, tiled_modes=(1,)),
-            _as_dynamic_tensor(v, (0, 1), alignment=16, tiled_modes=(1,)),
-            _as_dynamic_tensor(pair_bias, (0, 1, 2), alignment=16, tiled_modes=(1, 2)),
-            _as_dynamic_tensor(residual_mask, (0, 1), alignment=16, tiled_modes=(1,)),
-            _as_dynamic_tensor(out, (0, 1), alignment=16, tiled_modes=(1,)),
-            _as_dynamic_tensor(lse, (0, 1), alignment=16, tiled_modes=(1,)),
+            _as_dynamic_tensor(q, (0, 1, 2, 3), alignment=16, tiled_modes=(2,)),
+            _as_dynamic_tensor(k, (0, 1, 2, 3), alignment=16, tiled_modes=(2,)),
+            _as_dynamic_tensor(v, (0, 1, 2, 3), alignment=16, tiled_modes=(2,)),
+            _as_dynamic_layout_tensor(pair_bias, alignment=16, leading_dim=4),
+            _as_dynamic_tensor(
+                residual_mask, (0, 1, 4), alignment=16, tiled_modes=(4,)
+            ),
+            _as_dynamic_tensor(out, (0, 1, 2, 3), alignment=16, tiled_modes=(2,)),
+            _as_dynamic_tensor(lse, (0, 1, 2, 3), alignment=16, tiled_modes=(3,)),
             stream,
         )
 
@@ -1040,19 +1060,21 @@ class EvoAttentionForward:
         if stream is None:
             stream = torch.cuda.current_stream(device_index)
         cuda_stream = cuda.CUstream(stream.cuda_stream)
-        views = self._make_runtime_views(q, k, v, pair_bias, residual_mask, out, lse)
+        arguments = (q, k, v, pair_bias, residual_mask, out, lse)
 
         if self._compiled is None:
             with self._lock:
                 if self._compiled is None:
-                    compile_arguments = self._make_compile_arguments(views, cuda_stream)
+                    compile_arguments = self._make_compile_arguments(
+                        arguments, cuda_stream
+                    )
                     self._compiled = CompileCallable(
                         (PtxasOptions("--maxrregcount=255"), EnableTVMFFI)
                     )(_build_and_launch_forward, *compile_arguments)
                     self._device_index = device_index
                     self._compile_count += 1
 
-        self._compiled(*views, cuda_stream)
+        self._compiled(*arguments, cuda_stream)
 
 
 _FORWARD_KERNEL = EvoAttentionForward()

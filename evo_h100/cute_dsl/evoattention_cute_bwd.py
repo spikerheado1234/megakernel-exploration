@@ -1,9 +1,11 @@
 """Runtime head-dimension dispatch for CuTe-DSL EvoAttention backward.
 
-The backward interface accepts model-layout BF16 activations and gradients
-with shape ``[B, S, N, H, D]``. ``D`` selects the independently tuned D=32 or
-D=64 implementation; all launches and reductions for dQ, dK, dV, and
-dPairBias remain owned by the selected specialization.
+The interface consumes the same tensors saved by the model-facing forward:
+BF16 activations in ``[B, S, N, H, D]``, BF16 pair bias in
+``[B, 1, H, N, N]``, and a BF16 validity mask in ``[B, S, 1, 1, N]``.
+``D`` selects the independently tuned D=32 or D=64 implementation; all
+launches and reductions for dQ, dK, dV, and dPairBias remain owned by the
+selected specialization.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ def _specialization_module(head_dimension: int) -> str:
 
 
 class EvoAttentionBackward:
-    """Dispatch complete prepared backward calls by ``q.shape[-1]``."""
+    """Dispatch complete model-facing backward calls by ``q.shape[-1]``."""
 
     def __init__(self) -> None:
         self._kernels: dict[int, object] = {}
