@@ -182,7 +182,10 @@ def reference_module() -> ModuleType:
 def load_cute_forward() -> ForwardKernel:
     """Load the stable, cached TVM-FFI/CuTe launcher interface."""
     try:
-        from evoattention_cute import get_evoattention_forward
+        if __package__:
+            from .evoattention_cute import get_evoattention_forward
+        else:
+            from evoattention_cute import get_evoattention_forward
     except ImportError as exc:
         raise ImportError(
             f"expected {HERE / 'evoattention_cute.py'} to export "
@@ -547,7 +550,10 @@ def run_training_correctness_case(
     seed: int = 0,
 ) -> dict[str, float]:
     """Compare the public autograd entry point with corrected MegaFold Triton."""
-    from evoattention_cute import TritonEvoformer
+    if __package__:
+        from .evoattention_cute import TritonEvoformer
+    else:
+        from evoattention_cute import TritonEvoformer
 
     inputs = make_inputs(shape, device, seed=seed)
     upstream_gradient = torch.randn_like(inputs.q)

@@ -1,9 +1,11 @@
-"""Fused EvoAttention forward kernel for NVIDIA Hopper.
+"""Distributed fused EvoAttention forward for NVIDIA Hopper.
 
-The public entry point, :func:`get_evoattention_forward`, returns a cached
+The public entry point, :func:`get_distributed_evoattention_forward`, returns a cached
 TVM-FFI callable. It accepts tensors in MegaFold's model-facing contract:
 
-- query/key/value/output: ``[B, S, N, H, 32]`` BF16
+- query/key/value: ``[B, S, N, H, 32]`` BF16, where ``N = P * S``
+- each remote attention-output view: ``[B, S, S, H, 32]`` BF16
+- each remote residual-output view: ``[B, S, S, 128]`` BF16
 - pair bias: ``[B, 1, H, N, N]`` BF16
 - residual mask: ``[B, S, 1, 1, N]`` BF16 containing ``0`` or ``1``
 - log-sum-exp: ``[B, S, H, N]`` FP32
@@ -12,7 +14,9 @@ The implementation uses one TMA producer warp and two 128-thread WGMMA
 consumer warpgroups. The consumers process the same M=64 query rows for two
 adjacent sequences, sharing the BF16 pair-bias tile while keeping independent
 Q/K/V, residual-mask, output, and softmax state. B, S, H, and N remain runtime
-dynamic, while D=32 and the tile schedule are static.
+dynamic, while D=32 and the tile schedule are static. The epilogue divides
+each M=64 output tile into M=16 TMA stores and routes those stores directly to
+the symmetric output allocation on the owning NVSHMEM PE.
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ from cutlass.utils.layout import LayoutEnum
 
 
 HEAD_DIMENSION = 32
+RESIDUAL_DIMENSION = 128
 QUERY_TILE_SIZE = 64
 KEY_TILE_SIZE = 64
 CONSUMER_WARPGROUP_COUNT = 2
@@ -43,6 +48,8 @@ CONSUMER_THREAD_COUNT = CONSUMER_WARPGROUP_COUNT * THREADS_PER_WARPGROUP
 PRODUCER_WARP_INDEX = 8
 THREADS_PER_BLOCK = CONSUMER_THREAD_COUNT + 32
 CTA_OUTPUT_ROW_SLOTS = CONSUMER_WARPGROUP_COUNT * QUERY_TILE_SIZE
+MAX_WORLD_SIZE = 8
+REMOTE_STORE_ROWS = 16
 SHORT_SEQUENCE_LENGTH = 2 * KEY_TILE_SIZE
 SOFTMAX_SCALE = 1.0 / math.sqrt(HEAD_DIMENSION)
 KEY_VALUE_STAGES = 3
@@ -90,6 +97,178 @@ def _as_dynamic_layout_tensor(
     ).mark_layout_dynamic(leading_dim=leading_dim)
 
 
+@cute.jit
+def _store_remote_output_chunk(
+    output_tma: cute.CopyAtom,
+    output_tensor: cute.Tensor,
+    shared_output: cute.Tensor,
+    chunk: cutlass.Constexpr[int],
+    store_rows: cutlass.Constexpr[int],
+    local_query_block: cutlass.Int32,
+    head_idx: cutlass.Int32,
+    sequence_0: cutlass.Int32,
+    batch_idx: cutlass.Int32,
+):
+    """Store one destination-aligned chunk for both consumer warpgroups."""
+    output_tiles = cute.zipped_divide(
+        output_tensor, (HEAD_DIMENSION, store_rows)
+    )
+    output_problem_0 = output_tiles[
+        None, (0, None, head_idx, sequence_0, batch_idx)
+    ]
+    output_problem_1 = output_tiles[
+        None, (0, None, head_idx, sequence_0 + 1, batch_idx)
+    ]
+    chunks_per_consumer = QUERY_TILE_SIZE // store_rows
+    shared_output_0 = cute.local_tile(
+        shared_output,
+        (HEAD_DIMENSION, store_rows),
+        (0, chunk),
+    )
+    shared_output_1 = cute.local_tile(
+        shared_output,
+        (HEAD_DIMENSION, store_rows),
+        (0, chunks_per_consumer + chunk),
+    )
+    shared_partition_0, global_partition_0 = cute.nvgpu.cpasync.tma_partition(
+        output_tma,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(shared_output_0, 0, 2),
+        output_problem_0,
+    )
+    shared_partition_1, global_partition_1 = cute.nvgpu.cpasync.tma_partition(
+        output_tma,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(shared_output_1, 0, 2),
+        output_problem_1,
+    )
+    cute.copy(
+        output_tma,
+        shared_partition_0,
+        global_partition_0[None, local_query_block],
+    )
+    cute.copy(
+        output_tma,
+        shared_partition_1,
+        global_partition_1[None, local_query_block],
+    )
+
+
+@cute.jit
+def _load_residual_chunk(
+    input_tma: cute.CopyAtom,
+    input_tensor: cute.Tensor,
+    shared_input: cute.Tensor,
+    global_query_block: cutlass.Int32,
+    sequence_0: cutlass.Int32,
+    batch_idx: cutlass.Int32,
+    barrier_ptr: cute.Pointer,
+):
+    """Load one M=16 residual-input chunk for both owned sequences."""
+    input_tiles = cute.zipped_divide(
+        input_tensor, (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    input_problem_0 = input_tiles[
+        None, (0, None, sequence_0, batch_idx)
+    ]
+    input_problem_1 = input_tiles[
+        None, (0, None, sequence_0 + 1, batch_idx)
+    ]
+    shared_input_0 = cute.local_tile(
+        shared_input,
+        (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS),
+        (0, 0),
+    )
+    shared_input_1 = cute.local_tile(
+        shared_input,
+        (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS),
+        (0, 1),
+    )
+    shared_partition_0, global_partition_0 = cute.nvgpu.cpasync.tma_partition(
+        input_tma,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(shared_input_0, 0, 2),
+        input_problem_0,
+    )
+    shared_partition_1, global_partition_1 = cute.nvgpu.cpasync.tma_partition(
+        input_tma,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(shared_input_1, 0, 2),
+        input_problem_1,
+    )
+    cute.copy(
+        input_tma,
+        global_partition_0[None, global_query_block],
+        shared_partition_0,
+        tma_bar_ptr=barrier_ptr,
+    )
+    cute.copy(
+        input_tma,
+        global_partition_1[None, global_query_block],
+        shared_partition_1,
+        tma_bar_ptr=barrier_ptr,
+    )
+
+
+@cute.jit
+def _store_remote_residual_chunk(
+    output_tma: cute.CopyAtom,
+    output_tensor: cute.Tensor,
+    shared_input: cute.Tensor,
+    local_query_block: cutlass.Int32,
+    sequence_0: cutlass.Int32,
+    batch_idx: cutlass.Int32,
+):
+    """Store both M=16 residual-input chunks to one destination PE."""
+    output_tiles = cute.zipped_divide(
+        output_tensor, (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    output_problem_0 = output_tiles[
+        None, (0, None, sequence_0, batch_idx)
+    ]
+    output_problem_1 = output_tiles[
+        None, (0, None, sequence_0 + 1, batch_idx)
+    ]
+    shared_input_0 = cute.local_tile(
+        shared_input,
+        (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS),
+        (0, 0),
+    )
+    shared_input_1 = cute.local_tile(
+        shared_input,
+        (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS),
+        (0, 1),
+    )
+    shared_partition_0, global_partition_0 = cute.nvgpu.cpasync.tma_partition(
+        output_tma,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(shared_input_0, 0, 2),
+        output_problem_0,
+    )
+    shared_partition_1, global_partition_1 = cute.nvgpu.cpasync.tma_partition(
+        output_tma,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(shared_input_1, 0, 2),
+        output_problem_1,
+    )
+    cute.copy(
+        output_tma,
+        shared_partition_0,
+        global_partition_0[None, local_query_block],
+    )
+    cute.copy(
+        output_tma,
+        shared_partition_1,
+        global_partition_1[None, local_query_block],
+    )
+
+
 @cute.kernel
 def _evoattention_forward_kernel(
     q: cute.Tensor,
@@ -102,17 +281,29 @@ def _evoattention_forward_kernel(
     pair_bias_tensor: cute.Tensor,
     residual_mask_tma: cute.CopyAtom,
     residual_mask_tensor: cute.Tensor,
-    output_tma: cute.CopyAtom,
-    output_tensor: cute.Tensor,
+    residual_input_tma: cute.CopyAtom,
+    residual_input_tensor: cute.Tensor,
+    local_output_tma: cute.CopyAtom,
+    local_output_tensor: cute.Tensor,
+    output_tmas: tuple,
+    output_tensors: tuple,
+    residual_output_tmas: tuple,
+    residual_output_tensors: tuple,
+    completion_peers: tuple,
+    completion: cute.Tensor,
+    completion_counter: cute.Tensor,
+    completion_epoch: cutlass.Int32,
     lse: cute.Tensor,
     query_layout: cute.ComposedLayout,
     key_layout: cute.ComposedLayout,
     value_layout: cute.ComposedLayout,
     pair_bias_layout: cute.ComposedLayout,
     output_layout: cute.ComposedLayout,
+    residual_io_layout: cute.ComposedLayout,
     score_mma: cute.TiledMma,
     output_mma: cute.TiledMma,
     output_register_copy: cute.TiledCopy,
+    world_size: cutlass.Constexpr[int],
 ):
     """Run the warp-specialized SM90 forward pass.
 
@@ -178,6 +369,12 @@ def _evoattention_forward_kernel(
         output_layout.outer,
         swizzle=output_layout.inner,
     )
+    # Once the attention output has been issued to TMA, reinterpret the same
+    # 8 KiB allocation as two [C=128, M=16] residual-input tiles.
+    shared_residual_input = cute.make_tensor(
+        shared_output.iterator,
+        residual_io_layout.outer,
+    )
     query_ready = allocator.allocate_array(cutlass.Int64, CONSUMER_WARPGROUP_COUNT)
     key_value_ready = allocator.allocate_array(cutlass.Int64, KEY_VALUE_STAGES)
     key_value_free = allocator.allocate_array(cutlass.Int64, KEY_VALUE_STAGES)
@@ -210,7 +407,11 @@ def _evoattention_forward_kernel(
         cute.nvgpu.cpasync.prefetch_descriptor(value_tma)
         cute.nvgpu.cpasync.prefetch_descriptor(pair_bias_tma)
         cute.nvgpu.cpasync.prefetch_descriptor(residual_mask_tma)
-        cute.nvgpu.cpasync.prefetch_descriptor(output_tma)
+        cute.nvgpu.cpasync.prefetch_descriptor(residual_input_tma)
+        cute.nvgpu.cpasync.prefetch_descriptor(local_output_tma)
+        for peer in cutlass.range_constexpr(world_size):
+            cute.nvgpu.cpasync.prefetch_descriptor(output_tmas[peer])
+            cute.nvgpu.cpasync.prefetch_descriptor(residual_output_tmas[peer])
     cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
 
@@ -309,36 +510,6 @@ def _evoattention_forward_kernel(
         shared_mask,
         residual_mask_problem_1,
     )
-    output_tiles = cute.zipped_divide(
-        output_tensor, (HEAD_DIMENSION, QUERY_TILE_SIZE)
-    )
-    output_problem_0 = output_tiles[
-        None, (0, None, head_idx, sequence_0, batch_idx)
-    ]
-    output_problem_1 = output_tiles[
-        None, (0, None, head_idx, sequence_0 + 1, batch_idx)
-    ]
-    shared_output_0 = cute.local_tile(
-        shared_output, (HEAD_DIMENSION, QUERY_TILE_SIZE), (0, 0)
-    )
-    shared_output_1 = cute.local_tile(
-        shared_output, (HEAD_DIMENSION, QUERY_TILE_SIZE), (0, 1)
-    )
-    shared_output_partition_0, global_output_partition_0 = cute.nvgpu.cpasync.tma_partition(
-        output_tma,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(shared_output_0, 0, 2),
-        output_problem_0,
-    )
-    shared_output_partition_1, global_output_partition_1 = cute.nvgpu.cpasync.tma_partition(
-        output_tma,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(shared_output_1, 0, 2),
-        output_problem_1,
-    )
-
     num_key_blocks = n_ctx // KEY_TILE_SIZE
 
     if warp_idx == PRODUCER_WARP_INDEX:
@@ -714,18 +885,123 @@ def _evoattention_forward_kernel(
             number_of_threads=CONSUMER_THREAD_COUNT,
         )
         if consumer_warpgroup == 0 and warpgroup_thread_idx < 32:
-            cute.copy(
-                output_tma,
-                shared_output_partition_0,
-                global_output_partition_0[None, query_block],
+            remote_store_rows = REMOTE_STORE_ROWS
+            _store_remote_output_chunk(
+                local_output_tma,
+                local_output_tensor,
+                shared_output,
+                0,
+                QUERY_TILE_SIZE,
+                query_block,
+                head_idx,
+                sequence_0,
+                batch_idx,
             )
-            cute.copy(
-                output_tma,
-                shared_output_partition_1,
-                global_output_partition_1[None, query_block],
-            )
+            for chunk in cutlass.range_constexpr(
+                QUERY_TILE_SIZE // remote_store_rows
+            ):
+                global_query = (
+                    query_block * QUERY_TILE_SIZE + chunk * remote_store_rows
+                )
+                destination = global_query // sequence_count
+                local_query = global_query - destination * sequence_count
+                local_query_block = local_query // remote_store_rows
+                for peer in cutlass.range_constexpr(world_size):
+                    if destination == peer:
+                        _store_remote_output_chunk(
+                            output_tmas[peer],
+                            output_tensors[peer],
+                            shared_output,
+                            chunk,
+                            remote_store_rows,
+                            local_query_block,
+                            head_idx,
+                            sequence_0,
+                            batch_idx,
+                        )
             cute.arch.cp_async_bulk_commit_group()
             cute.arch.cp_async_bulk_wait_group(0)
+            if head_idx == 0:
+                for chunk in cutlass.range_constexpr(
+                    QUERY_TILE_SIZE // remote_store_rows
+                ):
+                    global_query_block = (
+                        query_block * QUERY_TILE_SIZE
+                        + chunk * remote_store_rows
+                    ) // remote_store_rows
+                    destination = (
+                        query_block * QUERY_TILE_SIZE
+                        + chunk * remote_store_rows
+                    ) // sequence_count
+                    local_query = (
+                        query_block * QUERY_TILE_SIZE
+                        + chunk * remote_store_rows
+                        - destination * sequence_count
+                    )
+                    local_query_block = local_query // remote_store_rows
+                    if warpgroup_thread_idx == 0:
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            query_ready,
+                            2
+                            * RESIDUAL_DIMENSION
+                            * remote_store_rows
+                            * 2,
+                        )
+                    _load_residual_chunk(
+                        residual_input_tma,
+                        residual_input_tensor,
+                        shared_residual_input,
+                        global_query_block,
+                        sequence_0,
+                        batch_idx,
+                        query_ready,
+                    )
+                    cute.arch.mbarrier_wait(query_ready, (chunk + 1) % 2)
+                    for peer in cutlass.range_constexpr(world_size):
+                        if destination == peer:
+                            _store_remote_residual_chunk(
+                                residual_output_tmas[peer],
+                                residual_output_tensors[peer],
+                                shared_residual_input,
+                                local_query_block,
+                                sequence_0,
+                                batch_idx,
+                            )
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0)
+            if warpgroup_thread_idx == 0:
+                cute.arch.fence_proxy("async.global")
+                completed_before = cute.arch.atomic_add(
+                    completion_counter.iterator,
+                    cutlass.Int32(1),
+                    sem="acq_rel",
+                    scope="gpu",
+                )
+                total_ctas = query_blocks * sequence_pairs * batch * heads
+                if completed_before == completion_epoch * total_ctas - 1:
+                    cute.arch.fence_acq_rel_sys()
+                    for peer in cutlass.range_constexpr(world_size):
+                        cute.arch.store(
+                            completion_peers[peer].iterator,
+                            completion_epoch,
+                            sem="release",
+                            scope="sys",
+                        )
+                    for source in cutlass.range_constexpr(world_size):
+                        signal = cute.domain_offset((source,), completion)
+                        observed = cute.arch.load(
+                            signal.iterator,
+                            cutlass.Int32,
+                            sem="acquire",
+                            scope="sys",
+                        )
+                        while observed < completion_epoch:
+                            observed = cute.arch.load(
+                                signal.iterator,
+                                cutlass.Int32,
+                                sem="acquire",
+                                scope="sys",
+                            )
 
 
 @cute.jit
@@ -735,8 +1011,37 @@ def _build_and_launch_forward(
     v: cute.Tensor,
     pair_bias: cute.Tensor,
     residual_mask: cute.Tensor,
-    out: cute.Tensor,
+    residual_input: cute.Tensor,
+    local_output: cute.Tensor,
+    out_peer_0: cute.Tensor,
+    out_peer_1: cute.Tensor,
+    out_peer_2: cute.Tensor,
+    out_peer_3: cute.Tensor,
+    out_peer_4: cute.Tensor,
+    out_peer_5: cute.Tensor,
+    out_peer_6: cute.Tensor,
+    out_peer_7: cute.Tensor,
+    residual_out_peer_0: cute.Tensor,
+    residual_out_peer_1: cute.Tensor,
+    residual_out_peer_2: cute.Tensor,
+    residual_out_peer_3: cute.Tensor,
+    residual_out_peer_4: cute.Tensor,
+    residual_out_peer_5: cute.Tensor,
+    residual_out_peer_6: cute.Tensor,
+    residual_out_peer_7: cute.Tensor,
+    completion_peer_0: cute.Tensor,
+    completion_peer_1: cute.Tensor,
+    completion_peer_2: cute.Tensor,
+    completion_peer_3: cute.Tensor,
+    completion_peer_4: cute.Tensor,
+    completion_peer_5: cute.Tensor,
+    completion_peer_6: cute.Tensor,
+    completion_peer_7: cute.Tensor,
+    completion: cute.Tensor,
+    completion_counter: cute.Tensor,
+    completion_epoch: cutlass.Int32,
     lse: cute.Tensor,
+    world_size: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     batch = q.shape[0]
@@ -809,8 +1114,77 @@ def _build_and_launch_forward(
         residual_mask.iterator,
         cute.select(residual_mask.layout, mode=[4, 1, 0]),
     )
-    output_view = cute.make_tensor(
-        out.iterator, cute.select(out.layout, mode=[4, 2, 3, 1, 0])
+    residual_input_view = cute.make_tensor(
+        residual_input.iterator,
+        cute.select(residual_input.layout, mode=[3, 2, 1, 0]),
+    )
+    local_output_view = cute.make_tensor(
+        local_output.iterator,
+        cute.select(local_output.layout, mode=[4, 2, 3, 1, 0]),
+    )
+    output_view_0 = cute.make_tensor(
+        out_peer_0.iterator,
+        cute.select(out_peer_0.layout, mode=[4, 2, 3, 1, 0]),
+    )
+    output_view_1 = cute.make_tensor(
+        out_peer_1.iterator,
+        cute.select(out_peer_1.layout, mode=[4, 2, 3, 1, 0]),
+    )
+    output_view_2 = cute.make_tensor(
+        out_peer_2.iterator,
+        cute.select(out_peer_2.layout, mode=[4, 2, 3, 1, 0]),
+    )
+    output_view_3 = cute.make_tensor(
+        out_peer_3.iterator,
+        cute.select(out_peer_3.layout, mode=[4, 2, 3, 1, 0]),
+    )
+    output_view_4 = cute.make_tensor(
+        out_peer_4.iterator,
+        cute.select(out_peer_4.layout, mode=[4, 2, 3, 1, 0]),
+    )
+    output_view_5 = cute.make_tensor(
+        out_peer_5.iterator,
+        cute.select(out_peer_5.layout, mode=[4, 2, 3, 1, 0]),
+    )
+    output_view_6 = cute.make_tensor(
+        out_peer_6.iterator,
+        cute.select(out_peer_6.layout, mode=[4, 2, 3, 1, 0]),
+    )
+    output_view_7 = cute.make_tensor(
+        out_peer_7.iterator,
+        cute.select(out_peer_7.layout, mode=[4, 2, 3, 1, 0]),
+    )
+    residual_output_view_0 = cute.make_tensor(
+        residual_out_peer_0.iterator,
+        cute.select(residual_out_peer_0.layout, mode=[3, 2, 1, 0]),
+    )
+    residual_output_view_1 = cute.make_tensor(
+        residual_out_peer_1.iterator,
+        cute.select(residual_out_peer_1.layout, mode=[3, 2, 1, 0]),
+    )
+    residual_output_view_2 = cute.make_tensor(
+        residual_out_peer_2.iterator,
+        cute.select(residual_out_peer_2.layout, mode=[3, 2, 1, 0]),
+    )
+    residual_output_view_3 = cute.make_tensor(
+        residual_out_peer_3.iterator,
+        cute.select(residual_out_peer_3.layout, mode=[3, 2, 1, 0]),
+    )
+    residual_output_view_4 = cute.make_tensor(
+        residual_out_peer_4.iterator,
+        cute.select(residual_out_peer_4.layout, mode=[3, 2, 1, 0]),
+    )
+    residual_output_view_5 = cute.make_tensor(
+        residual_out_peer_5.iterator,
+        cute.select(residual_out_peer_5.layout, mode=[3, 2, 1, 0]),
+    )
+    residual_output_view_6 = cute.make_tensor(
+        residual_out_peer_6.iterator,
+        cute.select(residual_out_peer_6.layout, mode=[3, 2, 1, 0]),
+    )
+    residual_output_view_7 = cute.make_tensor(
+        residual_out_peer_7.iterator,
+        cute.select(residual_out_peer_7.layout, mode=[3, 2, 1, 0]),
     )
     lse_view = cute.make_tensor(
         lse.iterator, cute.select(lse.layout, mode=[3, 2, 1, 0])
@@ -863,6 +1237,25 @@ def _build_and_launch_forward(
     )
     output_tma_layout = cute.tile_to_shape(
         output_layout_atom,
+        (HEAD_DIMENSION, REMOTE_STORE_ROWS),
+        order=(1, 0),
+    )
+    residual_io_layout_atom = output_layout_atom
+    residual_io_layout = cute.tile_to_shape(
+        residual_io_layout_atom,
+        (
+            RESIDUAL_DIMENSION,
+            CONSUMER_WARPGROUP_COUNT * REMOTE_STORE_ROWS,
+        ),
+        order=(1, 0),
+    )
+    residual_io_tma_layout = cute.tile_to_shape(
+        residual_io_layout_atom,
+        (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS),
+        order=(1, 0),
+    )
+    local_output_tma_layout = cute.tile_to_shape(
+        output_layout_atom,
         (HEAD_DIMENSION, QUERY_TILE_SIZE),
         order=(1, 0),
     )
@@ -896,11 +1289,115 @@ def _build_and_launch_forward(
         residual_mask_tma_layout,
         (KEY_TILE_SIZE,),
     )
-    output_tma, output_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
+    residual_input_tma, residual_input_tensor = (
+        cute.nvgpu.cpasync.make_tiled_tma_atom(
+            load_tma_op,
+            residual_input_view,
+            residual_io_tma_layout,
+            (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS),
+        )
+    )
+    local_output_tma, local_output_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
         cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
-        output_view,
-        output_tma_layout,
+        local_output_view,
+        local_output_tma_layout,
         (HEAD_DIMENSION, QUERY_TILE_SIZE),
+    )
+    output_tma_0, output_tensor_0 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
+        output_view_0,
+        output_tma_layout,
+        (HEAD_DIMENSION, REMOTE_STORE_ROWS),
+    )
+    output_tma_1, output_tensor_1 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), output_view_1,
+        output_tma_layout, (HEAD_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    output_tma_2, output_tensor_2 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), output_view_2,
+        output_tma_layout, (HEAD_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    output_tma_3, output_tensor_3 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), output_view_3,
+        output_tma_layout, (HEAD_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    output_tma_4, output_tensor_4 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), output_view_4,
+        output_tma_layout, (HEAD_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    output_tma_5, output_tensor_5 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), output_view_5,
+        output_tma_layout, (HEAD_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    output_tma_6, output_tensor_6 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), output_view_6,
+        output_tma_layout, (HEAD_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    output_tma_7, output_tensor_7 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), output_view_7,
+        output_tma_layout, (HEAD_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    residual_output_tma_0, residual_output_tensor_0 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), residual_output_view_0,
+        residual_io_tma_layout, (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    residual_output_tma_1, residual_output_tensor_1 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), residual_output_view_1,
+        residual_io_tma_layout, (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    residual_output_tma_2, residual_output_tensor_2 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), residual_output_view_2,
+        residual_io_tma_layout, (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    residual_output_tma_3, residual_output_tensor_3 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), residual_output_view_3,
+        residual_io_tma_layout, (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    residual_output_tma_4, residual_output_tensor_4 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), residual_output_view_4,
+        residual_io_tma_layout, (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    residual_output_tma_5, residual_output_tensor_5 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), residual_output_view_5,
+        residual_io_tma_layout, (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    residual_output_tma_6, residual_output_tensor_6 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), residual_output_view_6,
+        residual_io_tma_layout, (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    residual_output_tma_7, residual_output_tensor_7 = cute.nvgpu.cpasync.make_tiled_tma_atom(
+        cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), residual_output_view_7,
+        residual_io_tma_layout, (RESIDUAL_DIMENSION, REMOTE_STORE_ROWS)
+    )
+    output_tmas = (
+        output_tma_0, output_tma_1, output_tma_2, output_tma_3,
+        output_tma_4, output_tma_5, output_tma_6, output_tma_7,
+    )
+    output_tensors = (
+        output_tensor_0, output_tensor_1, output_tensor_2, output_tensor_3,
+        output_tensor_4, output_tensor_5, output_tensor_6, output_tensor_7,
+    )
+    residual_output_tmas = (
+        residual_output_tma_0, residual_output_tma_1,
+        residual_output_tma_2, residual_output_tma_3,
+        residual_output_tma_4, residual_output_tma_5,
+        residual_output_tma_6, residual_output_tma_7,
+    )
+    residual_output_tensors = (
+        residual_output_tensor_0, residual_output_tensor_1,
+        residual_output_tensor_2, residual_output_tensor_3,
+        residual_output_tensor_4, residual_output_tensor_5,
+        residual_output_tensor_6, residual_output_tensor_7,
+    )
+    completion_peers = (
+        completion_peer_0,
+        completion_peer_1,
+        completion_peer_2,
+        completion_peer_3,
+        completion_peer_4,
+        completion_peer_5,
+        completion_peer_6,
+        completion_peer_7,
     )
 
     _evoattention_forward_kernel(
@@ -914,17 +1411,29 @@ def _build_and_launch_forward(
         pair_bias_tensor,
         residual_mask_tma,
         residual_mask_tensor,
-        output_tma,
-        output_tensor,
+        residual_input_tma,
+        residual_input_tensor,
+        local_output_tma,
+        local_output_tensor,
+        output_tmas,
+        output_tensors,
+        residual_output_tmas,
+        residual_output_tensors,
+        completion_peers,
+        completion,
+        completion_counter,
+        completion_epoch,
         lse_view,
         query_layout,
         key_layout,
         value_layout,
         pair_bias_layout,
         output_layout,
+        residual_io_layout,
         score_mma,
         output_mma,
         output_register_copy,
+        world_size,
     ).launch(
         # Flatten the work grid into x: grid.y is limited to 65535, while the
         # largest target has P=B*S*H=65536 before accounting for query tiles.
@@ -940,10 +1449,18 @@ def _build_and_launch_forward(
     )
 
 
-class EvoAttentionForward:
-    """Validate inputs and lazily compile one dynamic TVM-FFI specialization."""
+class DistributedEvoAttentionForward:
+    """Compile one distributed forward specialization for a fixed world size."""
 
-    def __init__(self) -> None:
+    def __init__(self, world_size: int, source_rank: int) -> None:
+        if world_size not in (2, 4, 8):
+            raise ValueError(f"world_size must be 2, 4, or 8, got {world_size}")
+        self.world_size = world_size
+        if not 0 <= source_rank < world_size:
+            raise ValueError(
+                f"source_rank must be in [0, {world_size}), got {source_rank}"
+            )
+        self.source_rank = source_rank
         self._compiled = None
         self._compile_count = 0
         self._device_index: int | None = None
@@ -953,14 +1470,21 @@ class EvoAttentionForward:
     def compile_count(self) -> int:
         return self._compile_count
 
-    @staticmethod
     def _validate_arguments(
+        self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         pair_bias: torch.Tensor,
         residual_mask: torch.Tensor,
-        out: torch.Tensor,
+        residual_input: torch.Tensor,
+        local_output: torch.Tensor,
+        out_peers: tuple[torch.Tensor, ...],
+        residual_out_peers: tuple[torch.Tensor, ...],
+        completion_peers: tuple[torch.Tensor, ...],
+        completion: torch.Tensor,
+        completion_counter: torch.Tensor,
+        completion_epoch: int,
         lse: torch.Tensor,
     ) -> None:
         if q.ndim != 5:
@@ -968,9 +1492,10 @@ class EvoAttentionForward:
                 f"q must have shape [B, S, N, H, 32], got {tuple(q.shape)}"
             )
         batch, sequence_count, n_ctx, heads, dim = q.shape
-        if sequence_count != n_ctx:
+        if n_ctx != self.world_size * sequence_count:
             raise ValueError(
-                f"this forward requires S=N, got S={sequence_count}, N={n_ctx}"
+                "distributed forward requires N=world_size*S, got "
+                f"N={n_ctx}, world_size={self.world_size}, S={sequence_count}"
             )
         if dim != HEAD_DIMENSION:
             raise ValueError(f"head dimension must be {HEAD_DIMENSION}, got {dim}")
@@ -980,8 +1505,75 @@ class EvoAttentionForward:
             )
         if sequence_count % CONSUMER_WARPGROUP_COUNT:
             raise ValueError("S must be even so the two consumers can pair sequences")
-        if k.shape != q.shape or v.shape != q.shape or out.shape != q.shape:
-            raise ValueError("q, k, v and out must have identical shapes")
+        if k.shape != q.shape or v.shape != q.shape:
+            raise ValueError("q, k, and v must have identical shapes")
+        if local_output.shape != q.shape:
+            raise ValueError("local_output must have the same shape as q")
+        expected_residual_input_shape = (
+            batch,
+            sequence_count,
+            n_ctx,
+            RESIDUAL_DIMENSION,
+        )
+        if tuple(residual_input.shape) != expected_residual_input_shape:
+            raise ValueError(
+                "residual_input must have shape [B,S,N,128] = "
+                f"{expected_residual_input_shape}"
+            )
+        if len(out_peers) != self.world_size:
+            raise ValueError(
+                f"expected {self.world_size} peer output views, got {len(out_peers)}"
+            )
+        expected_output_shape = (
+            batch,
+            sequence_count,
+            sequence_count,
+            heads,
+            HEAD_DIMENSION,
+        )
+        if any(tuple(out.shape) != expected_output_shape for out in out_peers):
+            raise ValueError(
+                "each peer output must have shape [B,S,S,H,D] = "
+                f"{expected_output_shape}"
+            )
+        if len(residual_out_peers) != self.world_size:
+            raise ValueError(
+                f"expected {self.world_size} residual-output peer views, "
+                f"got {len(residual_out_peers)}"
+            )
+        expected_residual_output_shape = (
+            batch,
+            sequence_count,
+            sequence_count,
+            RESIDUAL_DIMENSION,
+        )
+        if any(
+            tuple(out.shape) != expected_residual_output_shape
+            for out in residual_out_peers
+        ):
+            raise ValueError(
+                "each residual-output peer must have shape [B,S,S,128] = "
+                f"{expected_residual_output_shape}"
+            )
+        if len(completion_peers) != self.world_size:
+            raise ValueError(
+                f"expected {self.world_size} completion peers, "
+                f"got {len(completion_peers)}"
+            )
+        if any(
+            tuple(completion.shape) != (1,)
+            for completion in completion_peers
+        ):
+            raise ValueError("completion peers must each have shape [1]")
+        if tuple(completion.shape) != (self.world_size,):
+            raise ValueError(
+                f"completion must have shape [{self.world_size}], "
+                f"got {tuple(completion.shape)}"
+            )
+        if tuple(completion_counter.shape) != (1,):
+            raise ValueError("completion_counter must have shape [1]")
+        if not 0 < completion_epoch < 2**31:
+            raise ValueError("completion_epoch must be a positive int32 value")
         if tuple(pair_bias.shape) != (batch, 1, heads, n_ctx, n_ctx):
             raise ValueError(
                 "pair_bias must have shape [B, 1, H, N, N], got "
@@ -997,41 +1589,107 @@ class EvoAttentionForward:
                 "lse must have shape [B, S, H, N], got " f"{tuple(lse.shape)}"
             )
 
-        tensors = (q, k, v, pair_bias, residual_mask, out, lse)
+        tensors = (
+            q,
+            k,
+            v,
+            pair_bias,
+            residual_mask,
+            residual_input,
+            local_output,
+            *out_peers,
+            *residual_out_peers,
+            *completion_peers,
+            completion,
+            completion_counter,
+            lse,
+        )
         if any(t.device != q.device for t in tensors):
             raise ValueError("all tensors must be on the same CUDA device")
         if q.device.type != "cuda":
             raise ValueError("EvoAttention requires CUDA tensors")
-        compact_tensors = (q, k, v, residual_mask, out, lse)
+        compact_tensors = (q, residual_mask, residual_input, local_output, lse)
         if any(not tensor.is_contiguous() for tensor in compact_tensors):
-            raise ValueError("Q/K/V/mask/output/LSE tensors must be contiguous")
+            raise ValueError("Q/mask/LSE tensors must be contiguous")
+        if any(
+            tensor.stride(-1) != 1
+            or any(stride < 0 for stride in tensor.stride())
+            for tensor in (k, v)
+        ):
+            raise ValueError("K/V must have positive strides and a contiguous D axis")
         if pair_bias.stride(-1) != 1 or any(stride < 0 for stride in pair_bias.stride()):
             raise ValueError("pair_bias must have a positive-stride contiguous K axis")
         if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
             raise TypeError("q, k and v must be bfloat16")
-        if out.dtype != torch.bfloat16:
-            raise TypeError("out must be bfloat16")
+        if local_output.dtype != torch.bfloat16:
+            raise TypeError("local_output must be bfloat16")
+        if any(out.dtype != torch.bfloat16 for out in out_peers):
+            raise TypeError("peer outputs must be bfloat16")
+        if any(out.stride(-1) != 1 for out in out_peers):
+            raise ValueError("peer outputs must have a contiguous head-dimension axis")
+        if residual_input.dtype != torch.bfloat16:
+            raise TypeError("residual_input must be bfloat16")
+        if any(out.dtype != torch.bfloat16 for out in residual_out_peers):
+            raise TypeError("residual-output peers must be bfloat16")
+        if any(out.stride(-1) != 1 for out in residual_out_peers):
+            raise ValueError("residual-output peers must have a contiguous C axis")
+        if any(completion.dtype != torch.int32 for completion in completion_peers):
+            raise TypeError("completion peers must be int32")
+        if any(not completion.is_contiguous() for completion in completion_peers):
+            raise ValueError("completion peers must be contiguous")
+        if completion_counter.dtype != torch.int32:
+            raise TypeError("completion_counter must be int32")
+        if not completion_counter.is_contiguous():
+            raise ValueError("completion_counter must be contiguous")
         if pair_bias.dtype != torch.bfloat16 or residual_mask.dtype != torch.bfloat16:
             raise TypeError("pair_bias and residual_mask must be bfloat16")
         if lse.dtype != torch.float32:
             raise TypeError("lse must be float32")
 
-    @staticmethod
     def _make_compile_arguments(
-        arguments: tuple[torch.Tensor, ...],
+        self,
+        arguments: tuple[object, ...],
         stream: cuda.CUstream,
     ) -> tuple[object, ...]:
-        q, k, v, pair_bias, residual_mask, out, lse = arguments
+        q, k, v, pair_bias, residual_mask, residual_input, local_output, *tail = arguments
+        out_peers = tail[:MAX_WORLD_SIZE]
+        residual_out_peers = tail[MAX_WORLD_SIZE : 2 * MAX_WORLD_SIZE]
+        completion_peers = tail[2 * MAX_WORLD_SIZE : 3 * MAX_WORLD_SIZE]
+        completion = tail[3 * MAX_WORLD_SIZE]
+        completion_counter = tail[3 * MAX_WORLD_SIZE + 1]
+        completion_epoch = tail[3 * MAX_WORLD_SIZE + 2]
+        lse = tail[3 * MAX_WORLD_SIZE + 3]
         return (
             _as_dynamic_tensor(q, (0, 1, 2, 3), alignment=16, tiled_modes=(2,)),
-            _as_dynamic_tensor(k, (0, 1, 2, 3), alignment=16, tiled_modes=(2,)),
-            _as_dynamic_tensor(v, (0, 1, 2, 3), alignment=16, tiled_modes=(2,)),
+            _as_dynamic_layout_tensor(k, alignment=16, leading_dim=4),
+            _as_dynamic_layout_tensor(v, alignment=16, leading_dim=4),
             _as_dynamic_layout_tensor(pair_bias, alignment=16, leading_dim=4),
             _as_dynamic_tensor(
                 residual_mask, (0, 1, 4), alignment=16, tiled_modes=(4,)
             ),
-            _as_dynamic_tensor(out, (0, 1, 2, 3), alignment=16, tiled_modes=(2,)),
+            _as_dynamic_tensor(
+                residual_input, (0, 1, 2), alignment=16, tiled_modes=(2,)
+            ),
+            _as_dynamic_tensor(
+                local_output, (0, 1, 2, 3), alignment=16, tiled_modes=(2,)
+            ),
+            *(
+                _as_dynamic_layout_tensor(out, alignment=16, leading_dim=4)
+                for out in out_peers
+            ),
+            *(
+                _as_dynamic_layout_tensor(out, alignment=16, leading_dim=3)
+                for out in residual_out_peers
+            ),
+            *(
+                _as_dynamic_tensor(completion, (0,), alignment=4)
+                for completion in completion_peers
+            ),
+            _as_dynamic_tensor(completion, (0,), alignment=4),
+            _as_dynamic_tensor(completion_counter, (0,), alignment=4),
+            completion_epoch,
             _as_dynamic_tensor(lse, (0, 1, 2, 3), alignment=16, tiled_modes=(3,)),
+            self.world_size,
             stream,
         )
 
@@ -1042,12 +1700,34 @@ class EvoAttentionForward:
         v: torch.Tensor,
         pair_bias: torch.Tensor,
         residual_mask: torch.Tensor,
-        out: torch.Tensor,
+        residual_input: torch.Tensor,
+        local_output: torch.Tensor,
+        out_peers: tuple[torch.Tensor, ...],
+        residual_out_peers: tuple[torch.Tensor, ...],
+        completion_peers: tuple[torch.Tensor, ...],
+        completion: torch.Tensor,
+        completion_counter: torch.Tensor,
+        completion_epoch: int,
         lse: torch.Tensor,
         *,
         stream=None,
     ) -> None:
-        self._validate_arguments(q, k, v, pair_bias, residual_mask, out, lse)
+        self._validate_arguments(
+            q,
+            k,
+            v,
+            pair_bias,
+            residual_mask,
+            residual_input,
+            local_output,
+            out_peers,
+            residual_out_peers,
+            completion_peers,
+            completion,
+            completion_counter,
+            completion_epoch,
+            lse,
+        )
         device_index = q.device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
@@ -1060,7 +1740,29 @@ class EvoAttentionForward:
         if stream is None:
             stream = torch.cuda.current_stream(device_index)
         cuda_stream = cuda.CUstream(stream.cuda_stream)
-        arguments = (q, k, v, pair_bias, residual_mask, out, lse)
+        padded_peers = out_peers + (out_peers[0],) * (MAX_WORLD_SIZE - self.world_size)
+        padded_residual_peers = residual_out_peers + (residual_out_peers[0],) * (
+            MAX_WORLD_SIZE - self.world_size
+        )
+        padded_completions = completion_peers + (completion_peers[0],) * (
+            MAX_WORLD_SIZE - self.world_size
+        )
+        arguments = (
+            q,
+            k,
+            v,
+            pair_bias,
+            residual_mask,
+            residual_input,
+            local_output,
+            *padded_peers,
+            *padded_residual_peers,
+            *padded_completions,
+            completion,
+            completion_counter,
+            completion_epoch,
+            lse,
+        )
 
         if self._compiled is None:
             with self._lock:
@@ -1076,13 +1778,20 @@ class EvoAttentionForward:
 
         self._compiled(*arguments, cuda_stream)
 
-
-_FORWARD_KERNEL = EvoAttentionForward()
-
-
-def get_evoattention_forward() -> EvoAttentionForward:
-    """Return the process-wide cached EvoAttention forward launcher."""
-    return _FORWARD_KERNEL
+_FORWARD_KERNELS: dict[tuple[int, int], DistributedEvoAttentionForward] = {}
 
 
-__all__ = ["get_evoattention_forward"]
+def get_distributed_evoattention_forward(
+    world_size: int,
+    source_rank: int,
+) -> DistributedEvoAttentionForward:
+    """Return the cached launcher for one distributed source rank."""
+    key = (world_size, source_rank)
+    if key not in _FORWARD_KERNELS:
+        _FORWARD_KERNELS[key] = DistributedEvoAttentionForward(
+            world_size, source_rank
+        )
+    return _FORWARD_KERNELS[key]
+
+
+__all__ = ["get_distributed_evoattention_forward"]

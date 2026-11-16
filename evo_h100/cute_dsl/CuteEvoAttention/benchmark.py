@@ -1,0 +1,1870 @@
+"""EvoAttention forward, backward, and combined benchmark: Triton vs CuTe-DSL.
+
+Compilation, allocation, and warmup are excluded. Forward timing starts with
+MegaFold-layout tensors and ends with MegaFold-layout output. The Triton path
+therefore includes pair-bias materialization, mask conversion, three input
+transposes, and its output transpose; CuTe consumes the prepared contiguous
+pair bias and model-layout activations directly. CUDA graphs remove Python
+dispatch gaps, and addresses rotate through a memory-bounded pool.
+Backward timing includes every launch/reduction needed for model-layout BF16
+dQ/dK/dV/dPairBias; this includes the reference's three output transposes.
+Combined timing encloses a dependent forward followed by the complete backward
+pass in one CUDA-event range. One CUDA graph is captured per rotating address
+slot so Python launch gaps are excluded. The default run covers all 32 shapes
+at D=32 and enforces a 2x CuTe speedup; pass ``--head-dim 64`` (or ``--d 64``)
+to benchmark the D=64 specialization.
+
+Examples:
+    CUDA_VISIBLE_DEVICES=1 python benchmark.py --direction combined
+    CUDA_VISIBLE_DEVICES=2 python benchmark.py --direction forward --head-dim 64
+    CUDA_VISIBLE_DEVICES=3 python benchmark.py --direction backward --quick
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import statistics
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Protocol
+
+import torch
+import triton
+
+if __package__:
+    from .test_kernel import (
+        SEQUENCE_LENGTHS,
+        SUPPORTED_HEAD_DIMENSIONS,
+        EvoAttentionInputs,
+        EvoAttentionOutputs,
+        EvoAttentionShape,
+        ForwardKernel,
+        ReferenceForwardWorkspace,
+        assert_single_compilation,
+        launch_cute,
+        launch_reference_prepared,
+        load_cute_forward,
+        make_inputs,
+        make_outputs,
+        make_reference_workspace,
+        prepare_reference_inputs,
+        reference_module,
+        select_shapes,
+    )
+else:
+    from test_kernel import (
+        SEQUENCE_LENGTHS,
+        SUPPORTED_HEAD_DIMENSIONS,
+        EvoAttentionInputs,
+        EvoAttentionOutputs,
+        EvoAttentionShape,
+        ForwardKernel,
+        ReferenceForwardWorkspace,
+        assert_single_compilation,
+        launch_cute,
+        launch_reference_prepared,
+        load_cute_forward,
+        make_inputs,
+        make_outputs,
+        make_reference_workspace,
+        prepare_reference_inputs,
+        reference_module,
+        select_shapes,
+    )
+
+
+DEFAULT_WARMUP = 10
+DEFAULT_REPEATS = 5
+DEFAULT_TARGET_MS = 200.0
+MIN_ITERS = 3
+MAX_ITERS = 1000
+REQUIRED_SPEEDUP = 2.0
+INPUT_POOL_BUDGET_BYTES = 2 * 1024**3
+BACKWARD_POOL_BUDGET_BYTES = 70 * 1024**3
+COMBINED_POOL_BUDGET_BYTES = 80 * 1024**3
+GPU_MEMORY_RESERVE_BYTES = 8 * 1024**3
+TRITON_FULL_BATCH_LIVE_BYTES_PER_ELEMENT = 18
+TRITON_FULL_BATCH_MEMORY_LIMIT_BYTES = 60 * 1024**3
+MAX_POOL_SLOTS = 8
+MAX_GRID_Y = 65_535
+
+
+@dataclass(frozen=True)
+class TimingStats:
+    median_ms: float
+    mean_ms: float
+    minimum_ms: float
+    maximum_ms: float
+    iterations: int
+    repeats: int
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    batch_size: int
+    num_heads: int
+    context_length: int
+    head_dimension: int
+    pool_slots: int
+    triton: TimingStats
+    cute: TimingStats
+
+    @property
+    def speedup(self) -> float:
+        return self.triton.median_ms / self.cute.median_ms
+
+    @property
+    def triton_tflops(self) -> float:
+        return _flops_from_dimensions(
+            self.batch_size,
+            self.num_heads,
+            self.context_length,
+            self.head_dimension,
+        ) / (self.triton.median_ms * 1.0e9)
+
+    @property
+    def cute_tflops(self) -> float:
+        return _flops_from_dimensions(
+            self.batch_size,
+            self.num_heads,
+            self.context_length,
+            self.head_dimension,
+        ) / (self.cute.median_ms * 1.0e9)
+
+
+@dataclass(frozen=True)
+class PreparedSlot:
+    """One allocation-free model-facing forward benchmark slot."""
+
+    inputs: EvoAttentionInputs
+    outputs: EvoAttentionOutputs
+    reference_workspace: ReferenceForwardWorkspace
+    triton_pair_bias_source: torch.Tensor
+    triton_pair_bias: torch.Tensor
+
+
+@dataclass(frozen=True)
+class BackwardBuffers:
+    """Internal-layout buffers used by the authoritative Triton backward."""
+
+    inputs: EvoAttentionInputs
+    forward: EvoAttentionOutputs
+    output_gradient: torch.Tensor
+    delta: torch.Tensor
+    query_gradient: torch.Tensor
+    key_gradient: torch.Tensor
+    value_gradient: torch.Tensor
+    pair_bias_accumulator: torch.Tensor
+    pair_bias_gradient: torch.Tensor
+
+
+@dataclass(frozen=True)
+class TritonBackwardSlot:
+    buffers: BackwardBuffers
+    public_query_gradient: torch.Tensor
+    public_key_gradient: torch.Tensor
+    public_value_gradient: torch.Tensor
+    gradient_batch_capacity: int
+
+
+@dataclass(frozen=True)
+class CuteBackwardSlot:
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    output: torch.Tensor
+    output_gradient: torch.Tensor
+    pair_bias: torch.Tensor
+    residual_mask: torch.Tensor
+    logsumexp: torch.Tensor
+    delta: torch.Tensor
+    query_gradient: torch.Tensor
+    key_gradient: torch.Tensor
+    value_gradient: torch.Tensor
+    pair_bias_accumulator: torch.Tensor
+    pair_bias_gradient: torch.Tensor
+
+
+@dataclass(frozen=True)
+class CuteCombinedChunk:
+    """One batch chunk connecting the forward output to backward inputs."""
+
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    output: torch.Tensor
+    output_gradient: torch.Tensor
+    pair_bias: torch.Tensor
+    residual_mask: torch.Tensor
+    logsumexp: torch.Tensor
+    delta: torch.Tensor
+    query_gradient: torch.Tensor
+    key_gradient: torch.Tensor
+    value_gradient: torch.Tensor
+    pair_bias_accumulator: torch.Tensor
+    pair_bias_gradient: torch.Tensor
+
+
+@dataclass(frozen=True)
+class CuteCombinedSlot:
+    """Prepared buffers for one dependent CuTe forward-plus-backward call."""
+
+    forward_inputs: EvoAttentionInputs
+    forward_outputs: EvoAttentionOutputs
+    backward_chunks: tuple[CuteCombinedChunk, ...]
+
+
+class BackwardKernel(Protocol):
+    """Prepared-layout interface exposed by the CuTe backward launcher."""
+
+    @property
+    def compile_count(self) -> int: ...
+
+    def clear_workspace_cache(self) -> None: ...
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        output: torch.Tensor,
+        output_gradient: torch.Tensor,
+        pair_bias: torch.Tensor,
+        residual_mask: torch.Tensor,
+        logsumexp: torch.Tensor,
+        delta: torch.Tensor,
+        query_gradient: torch.Tensor,
+        key_gradient: torch.Tensor,
+        value_gradient: torch.Tensor,
+        pair_bias_accumulator: torch.Tensor,
+        pair_bias_gradient: torch.Tensor,
+        *,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
+class BackwardBenchmarkResult:
+    batch_size: int
+    num_heads: int
+    context_length: int
+    head_dimension: int
+    pool_slots: int
+    triton: TimingStats
+    cute: TimingStats
+
+    @property
+    def speedup(self) -> float:
+        return self.triton.median_ms / self.cute.median_ms
+
+    @property
+    def cute_tflops(self) -> float:
+        # Five mathematical GEMMs; recomputation is intentionally excluded.
+        return _backward_flops_from_dimensions(
+            self.batch_size,
+            self.num_heads,
+            self.context_length,
+            self.head_dimension,
+        ) / (self.cute.median_ms * 1.0e9)
+
+
+@dataclass(frozen=True)
+class CombinedBenchmarkResult:
+    batch_size: int
+    num_heads: int
+    context_length: int
+    head_dimension: int
+    pool_slots: int
+    backward_batch_chunk: int
+    triton: TimingStats
+    cute: TimingStats
+
+    @property
+    def speedup(self) -> float:
+        return self.triton.median_ms / self.cute.median_ms
+
+    @property
+    def triton_tflops(self) -> float:
+        return _combined_flops_from_dimensions(
+            self.batch_size,
+            self.num_heads,
+            self.context_length,
+            self.head_dimension,
+        ) / (self.triton.median_ms * 1.0e9)
+
+    @property
+    def cute_tflops(self) -> float:
+        return _combined_flops_from_dimensions(
+            self.batch_size,
+            self.num_heads,
+            self.context_length,
+            self.head_dimension,
+        ) / (self.cute.median_ms * 1.0e9)
+
+
+def _slot_bytes(shape: EvoAttentionShape) -> int:
+    """Return the exact tensor bytes allocated for one benchmark slot."""
+    activation_elements = (
+        shape.batch_size
+        * shape.num_sequences
+        * shape.num_heads
+        * shape.context_length
+        * shape.head_dimension
+    )
+    pair_bias_elements = (
+        shape.batch_size * shape.num_heads * shape.context_length * shape.context_length
+    )
+    residual_mask_elements = (
+        shape.batch_size * shape.num_sequences * shape.context_length
+    )
+    logsumexp_elements = (
+        shape.batch_size * shape.num_sequences * shape.num_heads * shape.context_length
+    )
+    return (
+        # Public Q/K/V/output plus Triton Q/K/V/internal-output workspaces.
+        8 * activation_elements * 2
+        # CuTe's contiguous input, Triton's head-innermost source view, and
+        # Triton's contiguous materialization destination.
+        + pair_bias_elements * 6
+        + residual_mask_elements * (2 + 4)
+        + logsumexp_elements * 4
+    )
+
+
+def _pool_size(shape: EvoAttentionShape) -> int:
+    """Use multiple addresses when memory permits, without risking large OOMs."""
+    return max(
+        1,
+        min(MAX_POOL_SLOTS, INPUT_POOL_BUDGET_BYTES // _slot_bytes(shape)),
+    )
+
+
+def _make_pool(
+    shape: EvoAttentionShape,
+    device: torch.device,
+    *,
+    seed: int,
+) -> tuple[PreparedSlot, ...]:
+    pool = []
+    for slot in range(_pool_size(shape)):
+        inputs = make_inputs(shape, device, seed=seed + slot)
+        # MegaFold's bias projection writes [B, Q, K, H] contiguously and then
+        # exposes [B, H, Q, K].  Recreate that head-innermost source layout
+        # without changing its logical values.  Triton pays to materialize it
+        # into K-contiguous storage inside the timed region.
+        pair_bias_head_last = (
+            inputs.pair_bias[:, 0].permute(0, 2, 3, 1).contiguous()
+        )
+        triton_pair_bias_source = pair_bias_head_last.permute(0, 3, 1, 2)
+        if triton_pair_bias_source.stride(-1) != shape.num_heads:
+            raise AssertionError(
+                "MegaFold pair bias must have a head-innermost physical layout"
+            )
+        triton_pair_bias = torch.empty_like(inputs.pair_bias[:, 0])
+        pool.append(
+            PreparedSlot(
+                inputs=inputs,
+                outputs=make_outputs(inputs),
+                reference_workspace=make_reference_workspace(inputs),
+                triton_pair_bias_source=triton_pair_bias_source,
+                triton_pair_bias=triton_pair_bias,
+            )
+        )
+    return tuple(pool)
+
+
+def _launch_triton_forward_end_to_end(slot: PreparedSlot) -> None:
+    """Run every device operation required by the MegaFold Triton path."""
+    inputs = slot.inputs
+    outputs = slot.outputs
+    workspace = slot.reference_workspace
+    prepare_reference_inputs(inputs, workspace)
+    slot.triton_pair_bias.copy_(slot.triton_pair_bias_source)
+    launch_reference_prepared(
+        workspace.q,
+        workspace.k,
+        workspace.v,
+        slot.triton_pair_bias,
+        workspace.additive_mask,
+        workspace.output,
+        outputs.logsumexp,
+    )
+    outputs.output.copy_(workspace.output.transpose(2, 3))
+
+
+BenchmarkStep = Callable[[int], None]
+
+
+def _elapsed_ms(
+    step: BenchmarkStep,
+    *,
+    first_iteration: int,
+    iterations: int,
+) -> float:
+    """Average device time per launch, measured by a pair of CUDA events."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for offset in range(iterations):
+        step(first_iteration + offset)
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) / iterations
+
+
+def _calibrated_iterations(steps: Sequence[BenchmarkStep], target_ms: float) -> int:
+    # Use the slower implementation, keeping every repeat long enough to dwarf
+    # event resolution while preventing the largest cubic cases from dominating
+    # the whole suite.
+    single_ms = max(
+        _elapsed_ms(step, first_iteration=0, iterations=1) for step in steps
+    )
+    if single_ms <= 0.0:
+        return MAX_ITERS
+    return max(MIN_ITERS, min(MAX_ITERS, round(target_ms / single_ms)))
+
+
+def time_cuda_events(
+    step: BenchmarkStep,
+    *,
+    warmup: int,
+    iterations: int,
+    repeats: int,
+) -> TimingStats:
+    """Time an already-compiled, allocation-free callable with CUDA events."""
+    for iteration in range(warmup):
+        step(iteration)
+    torch.cuda.synchronize()
+    samples = [
+        _elapsed_ms(
+            step,
+            first_iteration=warmup + repeat * iterations,
+            iterations=iterations,
+        )
+        for repeat in range(repeats)
+    ]
+    return TimingStats(
+        median_ms=statistics.median(samples),
+        mean_ms=statistics.fmean(samples),
+        minimum_ms=min(samples),
+        maximum_ms=max(samples),
+        iterations=iterations,
+        repeats=repeats,
+    )
+
+
+def _flops_from_dimensions(
+    batch_size: int,
+    num_heads: int,
+    context_length: int,
+    head_dimension: int,
+) -> int:
+    # QK^T and PV, two FLOPs per multiply-accumulate.  The softmax and bias
+    # arithmetic are intentionally omitted, matching standard FA reporting.
+    return (
+        4
+        * batch_size
+        * context_length
+        * num_heads
+        * context_length**2
+        * head_dimension
+    )
+
+
+def _backward_flops_from_dimensions(
+    batch_size: int,
+    num_heads: int,
+    context_length: int,
+    head_dimension: int,
+) -> int:
+    """Return algorithmic backward FLOPs for its five matrix products."""
+    return (
+        10
+        * batch_size
+        * context_length
+        * num_heads
+        * context_length**2
+        * head_dimension
+    )
+
+
+def _combined_flops_from_dimensions(
+    batch_size: int,
+    num_heads: int,
+    context_length: int,
+    head_dimension: int,
+) -> int:
+    """Return forward plus backward algorithmic FLOPs."""
+    return _flops_from_dimensions(
+        batch_size,
+        num_heads,
+        context_length,
+        head_dimension,
+    ) + _backward_flops_from_dimensions(
+        batch_size,
+        num_heads,
+        context_length,
+        head_dimension,
+    )
+
+
+def benchmark_shape(
+    forward: ForwardKernel,
+    shape: EvoAttentionShape,
+    *,
+    device: torch.device,
+    warmup: int,
+    repeats: int,
+    target_ms: float,
+    fixed_iters: int | None,
+    seed: int,
+) -> BenchmarkResult:
+    pool = _make_pool(shape, device, seed=seed)
+
+    def triton_eager_step(iteration: int) -> None:
+        slot = pool[iteration % len(pool)]
+        _launch_triton_forward_end_to_end(slot)
+
+    def cute_eager_step(iteration: int) -> None:
+        slot = pool[iteration % len(pool)]
+        launch_cute(forward, slot.inputs, slot.outputs)
+
+    # The first call can compile/JIT.  Synchronization places all compilation
+    # and initialization firmly before calibration and timed event ranges.
+    with torch.inference_mode():
+        triton_eager_step(0)
+        cute_eager_step(0)
+    torch.cuda.synchronize(device)
+
+    triton_graphs = []
+    cute_graphs = []
+    with torch.inference_mode():
+        for slot in pool:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                _launch_triton_forward_end_to_end(slot)
+            triton_graphs.append(graph)
+        for slot in pool:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch_cute(forward, slot.inputs, slot.outputs)
+            cute_graphs.append(graph)
+    torch.cuda.synchronize(device)
+
+    def triton_step(iteration: int) -> None:
+        triton_graphs[iteration % len(triton_graphs)].replay()
+
+    def cute_step(iteration: int) -> None:
+        cute_graphs[iteration % len(cute_graphs)].replay()
+
+    iterations = fixed_iters or _calibrated_iterations(
+        (triton_step, cute_step), target_ms
+    )
+
+    # Alternate order by shape so clock/temperature drift does not systematically
+    # favor either implementation across the table.
+    if (shape.batch_size + shape.num_heads + shape.context_length // 128) % 2:
+        cute_timing = time_cuda_events(
+            cute_step, warmup=warmup, iterations=iterations, repeats=repeats
+        )
+        triton_timing = time_cuda_events(
+            triton_step, warmup=warmup, iterations=iterations, repeats=repeats
+        )
+    else:
+        triton_timing = time_cuda_events(
+            triton_step, warmup=warmup, iterations=iterations, repeats=repeats
+        )
+        cute_timing = time_cuda_events(
+            cute_step, warmup=warmup, iterations=iterations, repeats=repeats
+        )
+
+    result = BenchmarkResult(
+        batch_size=shape.batch_size,
+        num_heads=shape.num_heads,
+        context_length=shape.context_length,
+        head_dimension=shape.head_dimension,
+        pool_slots=len(pool),
+        triton=triton_timing,
+        cute=cute_timing,
+    )
+
+    triton_graphs.clear()
+    cute_graphs.clear()
+    pool = ()
+    gc.collect()
+    torch.cuda.empty_cache()
+    return result
+
+
+def _make_public_inputs(
+    shape: EvoAttentionShape,
+    device: torch.device,
+    seed: int,
+) -> tuple[torch.Tensor, ...]:
+    """Create one logical problem directly in the model-facing layout."""
+    generator = torch.Generator(device=device)
+    generator.manual_seed(
+        seed
+        ^ (shape.batch_size * 0x1F1F)
+        ^ (shape.num_heads * 0x101)
+        ^ shape.context_length
+        ^ (shape.head_dimension * 0x10001)
+    )
+    public_shape = (
+        shape.batch_size,
+        shape.num_sequences,
+        shape.context_length,
+        shape.num_heads,
+        shape.head_dimension,
+    )
+    q = torch.randn(
+        public_shape, dtype=torch.bfloat16, device=device, generator=generator
+    )
+    k = torch.randn(
+        public_shape, dtype=torch.bfloat16, device=device, generator=generator
+    )
+    v = torch.randn(
+        public_shape, dtype=torch.bfloat16, device=device, generator=generator
+    )
+    pair_bias = torch.randn(
+        (
+            shape.batch_size,
+            1,
+            shape.num_heads,
+            shape.context_length,
+            shape.context_length,
+        ),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    residual_mask = torch.empty(
+        (
+            shape.batch_size,
+            shape.num_sequences,
+            1,
+            1,
+            shape.context_length,
+        ),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    residual_mask.bernoulli_(0.875, generator=generator)
+    residual_mask[..., 0] = 1.0
+    return q, k, v, pair_bias, residual_mask, generator
+
+
+def _to_triton_layout(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.transpose(2, 3).contiguous()
+
+
+def _make_triton_backward_slot(
+    shape: EvoAttentionShape,
+    device: torch.device,
+    seed: int,
+    *,
+    gradient_batch_capacity: int | None = None,
+) -> TritonBackwardSlot:
+    q_public, k_public, v_public, public_pair_bias, public_mask, generator = (
+        _make_public_inputs(shape, device, seed)
+    )
+    public_shape = q_public.shape
+    q, k, v = map(_to_triton_layout, (q_public, k_public, v_public))
+    pair_bias = public_pair_bias[:, 0]
+    residual_mask = (public_mask.float() - 1.0).mul_(1.0e9).reshape(
+        shape.batch_size, shape.num_sequences, shape.context_length
+    )
+    inputs = EvoAttentionInputs(q, k, v, pair_bias, residual_mask)
+    forward = EvoAttentionOutputs(
+        output=torch.empty_like(q),
+        logsumexp=torch.empty(
+            (
+                shape.batch_size,
+                shape.num_sequences,
+                shape.num_heads,
+                shape.context_length,
+            ),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+    launch_reference_prepared(
+        q,
+        k,
+        v,
+        pair_bias,
+        residual_mask,
+        forward.output,
+        forward.logsumexp,
+    )
+    output_gradient = _to_triton_layout(
+        torch.randn(
+            public_shape,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+    )
+    del q_public, k_public, v_public
+    pair_shape = pair_bias.shape
+    activation_elements = _backward_activation_elements(shape)
+    # Keep the full model-layout outputs but bound Triton's internal-layout
+    # gradient scratch at the maximum shape.
+    if gradient_batch_capacity is None:
+        gradient_batch_capacity = (
+            1
+            if TRITON_FULL_BATCH_LIVE_BYTES_PER_ELEMENT * activation_elements
+            > TRITON_FULL_BATCH_MEMORY_LIMIT_BYTES
+            else shape.batch_size
+        )
+    if not 1 <= gradient_batch_capacity <= shape.batch_size:
+        raise ValueError("gradient batch capacity must be in [1, batch_size]")
+    gradient_shape = (
+        gradient_batch_capacity,
+        shape.num_sequences,
+        shape.num_heads,
+        shape.context_length,
+        shape.head_dimension,
+    )
+    statistics_shape = gradient_shape[:-1]
+    buffers = BackwardBuffers(
+        inputs=inputs,
+        forward=forward,
+        output_gradient=output_gradient,
+        delta=torch.empty(statistics_shape, dtype=torch.float32, device=device),
+        query_gradient=torch.empty(gradient_shape, dtype=torch.bfloat16, device=device),
+        key_gradient=torch.empty(gradient_shape, dtype=torch.bfloat16, device=device),
+        value_gradient=torch.empty(gradient_shape, dtype=torch.bfloat16, device=device),
+        pair_bias_accumulator=torch.empty(
+            pair_shape, dtype=torch.float32, device=device
+        ),
+        pair_bias_gradient=torch.empty(pair_shape, dtype=torch.bfloat16, device=device),
+    )
+    return TritonBackwardSlot(
+        buffers=buffers,
+        public_query_gradient=torch.empty(
+            public_shape, dtype=torch.bfloat16, device=device
+        ),
+        public_key_gradient=torch.empty(
+            public_shape, dtype=torch.bfloat16, device=device
+        ),
+        public_value_gradient=torch.empty(
+            public_shape, dtype=torch.bfloat16, device=device
+        ),
+        gradient_batch_capacity=gradient_batch_capacity,
+    )
+
+
+def _make_cute_backward_slot(
+    shape: EvoAttentionShape,
+    device: torch.device,
+    seed: int,
+) -> CuteBackwardSlot:
+    q, k, v, pair_bias, residual_mask, generator = _make_public_inputs(
+        shape, device, seed
+    )
+    prepared_pair_bias = pair_bias[:, 0]
+    additive_mask = (residual_mask.float() - 1.0).mul_(1.0e9).reshape(
+        shape.batch_size, shape.num_sequences, shape.context_length
+    )
+    internal_inputs = EvoAttentionInputs(
+        _to_triton_layout(q),
+        _to_triton_layout(k),
+        _to_triton_layout(v),
+        prepared_pair_bias,
+        additive_mask,
+    )
+    internal_forward = EvoAttentionOutputs(
+        output=torch.empty_like(internal_inputs.q),
+        logsumexp=torch.empty(
+            (
+                shape.batch_size,
+                shape.num_sequences,
+                shape.num_heads,
+                shape.context_length,
+            ),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+    launch_reference_prepared(
+        internal_inputs.q,
+        internal_inputs.k,
+        internal_inputs.v,
+        prepared_pair_bias,
+        additive_mask,
+        internal_forward.output,
+        internal_forward.logsumexp,
+    )
+    output = internal_forward.output.transpose(2, 3).contiguous()
+    logsumexp = internal_forward.logsumexp
+    del internal_inputs, internal_forward
+    output_gradient = torch.randn(
+        q.shape,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    pair_shape = prepared_pair_bias.shape
+    return CuteBackwardSlot(
+        q=q,
+        k=k,
+        v=v,
+        output=output,
+        output_gradient=output_gradient,
+        pair_bias=pair_bias,
+        residual_mask=residual_mask,
+        logsumexp=logsumexp,
+        delta=torch.empty_like(logsumexp),
+        query_gradient=torch.empty_like(q),
+        key_gradient=torch.empty_like(k),
+        value_gradient=torch.empty_like(v),
+        pair_bias_accumulator=torch.empty(
+            pair_shape, dtype=torch.float32, device=device
+        ),
+        pair_bias_gradient=torch.empty(pair_shape, dtype=torch.bfloat16, device=device),
+    )
+
+
+def _make_cute_combined_slot(
+    shape: EvoAttentionShape,
+    device: torch.device,
+    seed: int,
+    backward_batch_chunk: int,
+) -> CuteCombinedSlot:
+    """Prepare a true forward-to-backward CuTe dataflow without allocations.
+
+    Forward and backward consume the same MegaFold-facing Q/K/V, pair-bias,
+    and residual-mask tensors without an auxiliary conversion bridge.
+
+    Backward output buffers are sized to one batch chunk and reused serially.
+    This keeps the largest B=4/H=16/N=1024 collective below H100 memory limits
+    without changing the full-batch forward launch.
+    """
+    q, k, v, pair_bias, residual_mask, generator = _make_public_inputs(
+        shape, device, seed
+    )
+    forward_inputs = EvoAttentionInputs(
+        q=q,
+        k=k,
+        v=v,
+        pair_bias=pair_bias,
+        residual_mask=residual_mask,
+    )
+    forward_outputs = make_outputs(forward_inputs)
+
+    public_shape = q.shape
+    chunk_shape = (backward_batch_chunk, *public_shape[1:])
+    pair_chunk_shape = (
+        backward_batch_chunk,
+        shape.num_heads,
+        shape.context_length,
+        shape.context_length,
+    )
+    statistic_chunk_shape = (
+        backward_batch_chunk,
+        shape.num_sequences,
+        shape.num_heads,
+        shape.context_length,
+    )
+    query_gradient = torch.empty(chunk_shape, dtype=torch.bfloat16, device=device)
+    key_gradient = torch.empty_like(query_gradient)
+    value_gradient = torch.empty_like(query_gradient)
+    output_gradient = torch.randn(
+        public_shape,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    delta = torch.empty(statistic_chunk_shape, dtype=torch.float32, device=device)
+    pair_bias_accumulator = torch.empty(
+        pair_chunk_shape, dtype=torch.float32, device=device
+    )
+    pair_bias_gradient = torch.empty(
+        pair_chunk_shape, dtype=torch.bfloat16, device=device
+    )
+
+    chunks = []
+    for start in range(0, shape.batch_size, backward_batch_chunk):
+        stop = min(shape.batch_size, start + backward_batch_chunk)
+        chunk_batch = stop - start
+        chunks.append(
+            CuteCombinedChunk(
+                q=q[start:stop],
+                k=k[start:stop],
+                v=v[start:stop],
+                output=forward_outputs.output[start:stop],
+                output_gradient=output_gradient[start:stop],
+                pair_bias=forward_inputs.pair_bias[start:stop],
+                residual_mask=forward_inputs.residual_mask[start:stop],
+                logsumexp=forward_outputs.logsumexp[start:stop],
+                delta=delta[:chunk_batch],
+                query_gradient=query_gradient[:chunk_batch],
+                key_gradient=key_gradient[:chunk_batch],
+                value_gradient=value_gradient[:chunk_batch],
+                pair_bias_accumulator=pair_bias_accumulator[:chunk_batch],
+                pair_bias_gradient=pair_bias_gradient[:chunk_batch],
+            )
+        )
+    return CuteCombinedSlot(
+        forward_inputs=forward_inputs,
+        forward_outputs=forward_outputs,
+        backward_chunks=tuple(chunks),
+    )
+
+
+def _backward_activation_elements(shape: EvoAttentionShape) -> int:
+    return (
+        shape.batch_size
+        * shape.num_sequences
+        * shape.context_length
+        * shape.num_heads
+        * shape.head_dimension
+    )
+
+
+def _backward_slot_bytes(
+    shape: EvoAttentionShape,
+    *,
+    triton_reference: bool,
+) -> int:
+    activation = _backward_activation_elements(shape)
+    row = (
+        shape.batch_size * shape.num_sequences * shape.num_heads * shape.context_length
+    )
+    pair = (
+        shape.batch_size * shape.num_heads * shape.context_length * shape.context_length
+    )
+    mask = shape.batch_size * shape.num_sequences * shape.context_length
+    mask_bytes = (4 if triton_reference else 2) * mask
+    slot_bytes = 16 * activation + 8 * row + 8 * pair + mask_bytes
+    if triton_reference:
+        slot_bytes += 6 * activation
+    else:
+        # CuTe's largest cached temporary is an FP32 dQ accumulator.  The
+        # launcher bounds it to 8 GiB by splitting B when necessary.
+        slot_bytes += min(8 * 1024**3, 4 * activation)
+        slot_bytes += 4 * row
+    return slot_bytes
+
+
+def _backward_pool_size(
+    shape: EvoAttentionShape,
+    *,
+    triton_reference: bool,
+) -> int:
+    slot_bytes = _backward_slot_bytes(shape, triton_reference=triton_reference)
+    return max(1, min(MAX_POOL_SLOTS, BACKWARD_POOL_BUDGET_BYTES // slot_bytes))
+
+
+def _cute_combined_slot_bytes(
+    shape: EvoAttentionShape,
+    backward_batch_chunk: int,
+) -> int:
+    """Estimate retained tensors plus cached CuTe workspace for one slot."""
+    activation = _backward_activation_elements(shape)
+    activation_bytes = activation * 2
+    chunk_fraction_numerator = backward_batch_chunk
+    chunk_fraction_denominator = shape.batch_size
+    chunk_activation_bytes = (
+        activation_bytes * chunk_fraction_numerator // chunk_fraction_denominator
+    )
+    row = (
+        shape.batch_size * shape.num_sequences * shape.num_heads * shape.context_length
+    )
+    chunk_row = row * chunk_fraction_numerator // chunk_fraction_denominator
+    pair = (
+        shape.batch_size * shape.num_heads * shape.context_length * shape.context_length
+    )
+    chunk_pair = pair * chunk_fraction_numerator // chunk_fraction_denominator
+    mask = shape.batch_size * shape.num_sequences * shape.context_length
+
+    # Full-size public buffers: Q/K/V, forward output, and dO.
+    full_activation_buffers = 5 * activation_bytes
+    # Reused chunk buffers: dQ/dK/dV.
+    chunk_activation_buffers = 3 * chunk_activation_bytes
+    # Backward's cached FP32 dQ accumulator is twice a BF16 activation buffer.
+    backward_workspace = 2 * chunk_activation_bytes + 4 * chunk_row
+    return (
+        full_activation_buffers
+        + chunk_activation_buffers
+        + backward_workspace
+        + 2 * pair  # BF16 pair-bias input
+        + 6 * chunk_pair  # FP32 accumulator and BF16 dPairBias
+        + 2 * mask  # BF16 residual mask
+        + 4 * row  # forward LSE
+        + 4 * chunk_row  # backward delta
+    )
+
+
+def _combined_pool_plan(
+    shape: EvoAttentionShape,
+    device: torch.device,
+) -> tuple[int, int]:
+    """Choose a memory-safe backward chunk and common address-pool size."""
+    with torch.cuda.device(device):
+        free_bytes, _ = torch.cuda.mem_get_info()
+    usable_bytes = min(
+        COMBINED_POOL_BUDGET_BYTES,
+        max(1, free_bytes - GPU_MEMORY_RESERVE_BYTES),
+    )
+    backward_batch_chunk = next(
+        (
+            chunk
+            for chunk in range(shape.batch_size, 0, -1)
+            if _cute_combined_slot_bytes(shape, chunk) <= usable_bytes
+        ),
+        None,
+    )
+    if backward_batch_chunk is None:
+        required_gib = _cute_combined_slot_bytes(shape, 1) / 1024**3
+        available_gib = usable_bytes / 1024**3
+        raise RuntimeError(
+            "insufficient free GPU memory for the combined benchmark: "
+            f"requires about {required_gib:.1f} GiB, "
+            f"has {available_gib:.1f} GiB after reserve"
+        )
+
+    cute_bytes = _cute_combined_slot_bytes(shape, backward_batch_chunk)
+    triton_bytes = _backward_slot_bytes(shape, triton_reference=True)
+    pool_slots = max(
+        1,
+        min(MAX_POOL_SLOTS, usable_bytes // max(cute_bytes, triton_bytes)),
+    )
+    return backward_batch_chunk, pool_slots
+
+
+def _slice_backward_buffers(
+    buffers: BackwardBuffers,
+    start: int,
+    stop: int,
+) -> BackwardBuffers:
+    inputs = buffers.inputs
+    forward = buffers.forward
+    return BackwardBuffers(
+        inputs=EvoAttentionInputs(
+            inputs.q[start:stop],
+            inputs.k[start:stop],
+            inputs.v[start:stop],
+            inputs.pair_bias[start:stop],
+            inputs.residual_mask[start:stop],
+        ),
+        forward=EvoAttentionOutputs(
+            forward.output[start:stop],
+            forward.logsumexp[start:stop],
+        ),
+        output_gradient=buffers.output_gradient[start:stop],
+        delta=buffers.delta[: stop - start],
+        query_gradient=buffers.query_gradient[: stop - start],
+        key_gradient=buffers.key_gradient[: stop - start],
+        value_gradient=buffers.value_gradient[: stop - start],
+        pair_bias_accumulator=buffers.pair_bias_accumulator[start:stop],
+        pair_bias_gradient=buffers.pair_bias_gradient[start:stop],
+    )
+
+
+def _launch_triton_backward_chunk(reference, buffers: BackwardBuffers) -> None:
+    q = buffers.inputs.q
+    k = buffers.inputs.k
+    v = buffers.inputs.v
+    pair_bias = buffers.inputs.pair_bias
+    residual_mask = buffers.inputs.residual_mask
+    output = buffers.forward.output
+    output_gradient = buffers.output_gradient
+    logsumexp = buffers.forward.logsumexp
+    delta = buffers.delta
+    dq = buffers.query_gradient
+    dk = buffers.key_gradient
+    dv = buffers.value_gradient
+    dpb = buffers.pair_bias_accumulator
+    batch, sequence_count, heads, context_length, dimension = q.shape
+    problem_count = batch * sequence_count * heads
+
+    reference._attn_bwd_preprocess[(triton.cdiv(context_length, 32), problem_count, 1)](
+        O=output,
+        dO=output_gradient,
+        D=delta,
+        SEQ_LEN=context_length,
+        DIM=dimension,
+        BLOCK_DIM=dimension,
+        BLOCK_SIZE_Q=32,
+        num_stages=2,
+        num_warps=4,
+    )
+    common = dict(
+        Q=q,
+        K=k,
+        V=v,
+        res_mask=residual_mask,
+        pair_bias=pair_bias,
+        softmax_scale=dimension**-0.5,
+        dO=output_gradient,
+        dQ=dq,
+        dK=dk,
+        dV=dv,
+        M=logsumexp,
+        D=delta,
+        stride_batch=q.stride(0),
+        stride_msa=q.stride(1),
+        stride_head=q.stride(2),
+        stride_seq=q.stride(3),
+        stride_pair_bias_batch=pair_bias.stride(0),
+        stride_pair_bias_head=pair_bias.stride(1),
+        stride_pair_bias_seq1=pair_bias.stride(2),
+        stride_pair_bias_seq2=pair_bias.stride(3),
+        stride_mask_batch=residual_mask.stride(0),
+        stride_mask_msa=residual_mask.stride(1),
+        stride_mask_seq=residual_mask.stride(2),
+        HEAD=heads,
+        N_SEQ=sequence_count,
+        SEQ_LEN=context_length,
+        BLOCK_DIM=dimension,
+        DIM=dimension,
+    )
+    reference._attn_bwd_dk_dv[(triton.cdiv(context_length, 16), problem_count, 1)](
+        **common,
+        BLOCK_SIZE_Q=64,
+        BLOCK_SIZE_KV=16,
+        num_stages=3,
+        num_warps=4,
+    )
+    reference._attn_bwd_dq[(triton.cdiv(context_length, 16), problem_count, 1)](
+        **common,
+        d_pair_bias=dpb,
+        stride_d_pair_bias_batch=dpb.stride(0),
+        stride_d_pair_bias_head=dpb.stride(1),
+        stride_d_pair_bias_seq1=dpb.stride(2),
+        stride_d_pair_bias_seq2=dpb.stride(3),
+        BLOCK_SIZE_Q=16,
+        BLOCK_SIZE_KV=64,
+        num_stages=3,
+        num_warps=4,
+    )
+
+
+def _launch_triton_public_backward(
+    reference,
+    slot: TritonBackwardSlot,
+) -> None:
+    buffers = slot.buffers
+    buffers.pair_bias_accumulator.zero_()
+    batch, sequence_count, heads, _, _ = buffers.inputs.q.shape
+    batch_chunk = min(
+        slot.gradient_batch_capacity,
+        max(1, MAX_GRID_Y // (sequence_count * heads)),
+    )
+    for start in range(0, batch, batch_chunk):
+        chunk = _slice_backward_buffers(
+            buffers,
+            start,
+            min(batch, start + batch_chunk),
+        )
+        _launch_triton_backward_chunk(reference, chunk)
+        slot.public_query_gradient[start : start + chunk.inputs.q.shape[0]].copy_(
+            chunk.query_gradient.transpose(2, 3)
+        )
+        slot.public_key_gradient[start : start + chunk.inputs.q.shape[0]].copy_(
+            chunk.key_gradient.transpose(2, 3)
+        )
+        slot.public_value_gradient[start : start + chunk.inputs.q.shape[0]].copy_(
+            chunk.value_gradient.transpose(2, 3)
+        )
+    buffers.pair_bias_gradient.copy_(buffers.pair_bias_accumulator)
+
+
+def _launch_cute_backward(backward: BackwardKernel, slot: CuteBackwardSlot) -> None:
+    backward(
+        slot.q,
+        slot.k,
+        slot.v,
+        slot.output,
+        slot.output_gradient,
+        slot.pair_bias,
+        slot.residual_mask,
+        slot.logsumexp,
+        slot.delta,
+        slot.query_gradient,
+        slot.key_gradient,
+        slot.value_gradient,
+        slot.pair_bias_accumulator,
+        slot.pair_bias_gradient,
+        stream=torch.cuda.current_stream(slot.q.device),
+    )
+
+
+def _launch_triton_combined(reference, slot: TritonBackwardSlot) -> None:
+    """Launch a dependent reference forward and complete public backward."""
+    buffers = slot.buffers
+    launch_reference_prepared(
+        buffers.inputs.q,
+        buffers.inputs.k,
+        buffers.inputs.v,
+        buffers.inputs.pair_bias,
+        buffers.inputs.residual_mask,
+        buffers.forward.output,
+        buffers.forward.logsumexp,
+    )
+    _launch_triton_public_backward(reference, slot)
+
+
+def _launch_cute_combined(
+    forward: ForwardKernel,
+    backward: BackwardKernel,
+    slot: CuteCombinedSlot,
+) -> None:
+    """Launch a dependent model-layout forward and complete backward."""
+    launch_cute(forward, slot.forward_inputs, slot.forward_outputs)
+    stream = torch.cuda.current_stream(slot.forward_outputs.output.device)
+    for chunk in slot.backward_chunks:
+        backward(
+            chunk.q,
+            chunk.k,
+            chunk.v,
+            chunk.output,
+            chunk.output_gradient,
+            chunk.pair_bias,
+            chunk.residual_mask,
+            chunk.logsumexp,
+            chunk.delta,
+            chunk.query_gradient,
+            chunk.key_gradient,
+            chunk.value_gradient,
+            chunk.pair_bias_accumulator,
+            chunk.pair_bias_gradient,
+            stream=stream,
+        )
+
+
+def _benchmark_implementation(
+    make_slot,
+    launch,
+    shape: EvoAttentionShape,
+    *,
+    device: torch.device,
+    seed: int,
+    target_ms: float,
+    warmup: int,
+    repeats: int,
+    fixed_iters: int | None,
+    pool_slots: int,
+    capture_graph: bool = False,
+) -> TimingStats:
+    slots = tuple(make_slot(shape, device, seed + index) for index in range(pool_slots))
+
+    def eager_step(iteration: int) -> None:
+        launch(slots[iteration % len(slots)])
+
+    # Compile every code path and populate pointer-keyed launcher caches before
+    # timing or graph capture. This also keeps capture-time allocations illegal.
+    for slot in slots:
+        launch(slot)
+    torch.cuda.synchronize(device)
+
+    if capture_graph:
+        graphs = []
+        for slot in slots:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch(slot)
+            graphs.append(graph)
+        torch.cuda.synchronize(device)
+
+        def step(iteration: int) -> None:
+            graphs[iteration % len(graphs)].replay()
+
+    else:
+        step = eager_step
+
+    iterations = fixed_iters or _calibrated_iterations((step,), target_ms)
+    result = time_cuda_events(
+        step,
+        warmup=warmup,
+        iterations=iterations,
+        repeats=repeats,
+    )
+    del step
+    if capture_graph:
+        del graphs
+    slots = ()
+    gc.collect()
+    torch.cuda.empty_cache()
+    return result
+
+
+def benchmark_backward_shape(
+    backward: BackwardKernel,
+    shape: EvoAttentionShape,
+    *,
+    device: torch.device,
+    warmup: int,
+    repeats: int,
+    target_ms: float,
+    fixed_iters: int | None,
+    seed: int,
+) -> BackwardBenchmarkResult:
+    clear_cache = getattr(backward, "clear_workspace_cache", None)
+    if clear_cache is not None:
+        clear_cache()
+    reference = reference_module()
+    # Rotate both implementations through the same number of addresses.  The
+    # smaller memory-safe capacity wins so neither side receives a warmer cache.
+    pool_slots = min(
+        _backward_pool_size(shape, triton_reference=True),
+        _backward_pool_size(shape, triton_reference=False),
+    )
+    common = dict(
+        shape=shape,
+        device=device,
+        seed=seed,
+        target_ms=target_ms,
+        warmup=warmup,
+        repeats=repeats,
+        pool_slots=pool_slots,
+    )
+
+    def benchmark_triton(iterations: int | None = None) -> TimingStats:
+        return _benchmark_implementation(
+            _make_triton_backward_slot,
+            lambda slot: _launch_triton_public_backward(reference, slot),
+            fixed_iters=fixed_iters if fixed_iters is not None else iterations,
+            **common,
+        )
+
+    def benchmark_cute(iterations: int | None = None) -> TimingStats:
+        return _benchmark_implementation(
+            _make_cute_backward_slot,
+            lambda slot: _launch_cute_backward(backward, slot),
+            fixed_iters=fixed_iters if fixed_iters is not None else iterations,
+            **common,
+        )
+
+    if (shape.batch_size + shape.num_heads + shape.context_length // 128) % 2:
+        cute_timing = benchmark_cute()
+        if clear_cache is not None:
+            clear_cache()
+        triton_timing = benchmark_triton(cute_timing.iterations)
+    else:
+        triton_timing = benchmark_triton()
+        cute_timing = benchmark_cute(triton_timing.iterations)
+        if clear_cache is not None:
+            clear_cache()
+    return BackwardBenchmarkResult(
+        batch_size=shape.batch_size,
+        num_heads=shape.num_heads,
+        context_length=shape.context_length,
+        head_dimension=shape.head_dimension,
+        pool_slots=pool_slots,
+        triton=triton_timing,
+        cute=cute_timing,
+    )
+
+
+def benchmark_combined_shape(
+    forward: ForwardKernel,
+    backward: BackwardKernel,
+    shape: EvoAttentionShape,
+    *,
+    device: torch.device,
+    warmup: int,
+    repeats: int,
+    target_ms: float,
+    fixed_iters: int | None,
+    seed: int,
+    capture_graph: bool,
+) -> CombinedBenchmarkResult:
+    """Benchmark one dependent forward plus complete backward operation."""
+    clear_cache = getattr(backward, "clear_workspace_cache", None)
+    if clear_cache is not None:
+        clear_cache()
+    reference = reference_module()
+    backward_batch_chunk, pool_slots = _combined_pool_plan(shape, device)
+    common = dict(
+        shape=shape,
+        device=device,
+        seed=seed,
+        target_ms=target_ms,
+        warmup=warmup,
+        repeats=repeats,
+        pool_slots=pool_slots,
+    )
+
+    def benchmark_triton(iterations: int | None = None) -> TimingStats:
+        return _benchmark_implementation(
+            lambda current_shape, current_device, current_seed: (
+                _make_triton_backward_slot(
+                    current_shape,
+                    current_device,
+                    current_seed,
+                    gradient_batch_capacity=backward_batch_chunk,
+                )
+            ),
+            lambda slot: _launch_triton_combined(reference, slot),
+            fixed_iters=fixed_iters if fixed_iters is not None else iterations,
+            capture_graph=capture_graph,
+            **common,
+        )
+
+    def benchmark_cute(iterations: int | None = None) -> TimingStats:
+        return _benchmark_implementation(
+            lambda current_shape, current_device, current_seed: (
+                _make_cute_combined_slot(
+                    current_shape,
+                    current_device,
+                    current_seed,
+                    backward_batch_chunk,
+                )
+            ),
+            lambda slot: _launch_cute_combined(forward, backward, slot),
+            fixed_iters=fixed_iters if fixed_iters is not None else iterations,
+            capture_graph=capture_graph,
+            **common,
+        )
+
+    # Alternate implementation order by shape to avoid consistently assigning
+    # the cooler GPU clock state to one side. Both sides use the same address
+    # count, iteration count, and backward batch partition.
+    if (shape.batch_size + shape.num_heads + shape.context_length // 128) % 2:
+        cute_timing = benchmark_cute()
+        if clear_cache is not None:
+            clear_cache()
+        triton_timing = benchmark_triton(cute_timing.iterations)
+    else:
+        triton_timing = benchmark_triton()
+        cute_timing = benchmark_cute(triton_timing.iterations)
+        if clear_cache is not None:
+            clear_cache()
+
+    return CombinedBenchmarkResult(
+        batch_size=shape.batch_size,
+        num_heads=shape.num_heads,
+        context_length=shape.context_length,
+        head_dimension=shape.head_dimension,
+        pool_slots=pool_slots,
+        backward_batch_chunk=backward_batch_chunk,
+        triton=triton_timing,
+        cute=cute_timing,
+    )
+
+
+def _print_forward_header() -> None:
+    print(
+        f"{'B':>2} {'H':>3} {'D':>3} {'N=S':>5} {'slots':>5}  "
+        f"{'Triton ms':>11} {'CuTe ms':>11} {'speedup':>9}  "
+        f"{'Triton TF/s':>12} {'CuTe TF/s':>10} {'iters':>6} {'pass':>5}"
+    )
+    print("-" * 110)
+
+
+def _print_forward_result(result: BenchmarkResult, required_speedup: float) -> None:
+    passed = result.speedup >= required_speedup
+    print(
+        f"{result.batch_size:2d} {result.num_heads:3d} "
+        f"{result.head_dimension:3d} "
+        f"{result.context_length:5d} {result.pool_slots:5d}  "
+        f"{result.triton.median_ms:11.4f} {result.cute.median_ms:11.4f} "
+        f"{result.speedup:8.3f}x  {result.triton_tflops:12.2f} "
+        f"{result.cute_tflops:10.2f} {result.cute.iterations:6d} "
+        f"{'yes' if passed else 'NO':>5}",
+        flush=True,
+    )
+
+
+def _print_combined_header() -> None:
+    print(
+        f"{'B':>2} {'H':>3} {'D':>3} {'N=S':>5} "
+        f"{'slots':>5} {'bwd chunk':>9}  "
+        f"{'Triton ms':>11} {'CuTe ms':>11} {'speedup':>9}  "
+        f"{'Triton TF/s':>12} {'CuTe TF/s':>10} {'iters':>6} {'pass':>5}"
+    )
+    print("-" * 121)
+
+
+def _print_combined_result(
+    result: CombinedBenchmarkResult,
+    required_speedup: float,
+) -> None:
+    passed = result.speedup >= required_speedup
+    print(
+        f"{result.batch_size:2d} {result.num_heads:3d} "
+        f"{result.head_dimension:3d} "
+        f"{result.context_length:5d} {result.pool_slots:5d} "
+        f"{result.backward_batch_chunk:9d}  "
+        f"{result.triton.median_ms:11.4f} {result.cute.median_ms:11.4f} "
+        f"{result.speedup:8.3f}x  {result.triton_tflops:12.2f} "
+        f"{result.cute_tflops:10.2f} {result.cute.iterations:6d} "
+        f"{'yes' if passed else 'NO':>5}",
+        flush=True,
+    )
+
+
+def _write_json(
+    path: Path,
+    results: Sequence[BenchmarkResult],
+    args: argparse.Namespace,
+) -> None:
+    serialized_results = []
+    for result in results:
+        serialized = asdict(result)
+        serialized.update(
+            speedup=result.speedup,
+            triton_tflops=result.triton_tflops,
+            cute_tflops=result.cute_tflops,
+        )
+        serialized_results.append(serialized)
+    payload = {
+        "device": torch.cuda.get_device_name(torch.cuda.current_device()),
+        "head_dimension": args.head_dim,
+        "required_speedup": args.required_speedup,
+        "timing": (
+            "CUDA-event timing of CUDA-graph replay from MegaFold-layout inputs "
+            "to MegaFold-layout output; Triton includes head-innermost pair-bias "
+            "materialization, mask conversion, and Q/K/V/output layout copies; "
+            "allocation, compilation, capture, and warmup excluded; median of "
+            "repeat averages with rotating addresses"
+        ),
+        "results": serialized_results,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _write_backward_json(
+    path: Path,
+    results: Sequence[BackwardBenchmarkResult],
+    args: argparse.Namespace,
+    compile_count: int,
+) -> None:
+    serialized_results = []
+    for result in results:
+        serialized = asdict(result)
+        serialized.update(
+            speedup=result.speedup,
+            cute_tflops=result.cute_tflops,
+        )
+        serialized_results.append(serialized)
+    payload = {
+        "direction": "backward",
+        "device": torch.cuda.get_device_name(torch.cuda.current_device()),
+        "head_dimension": args.head_dim,
+        "required_speedup": args.required_speedup,
+        "compile_count": compile_count,
+        "timing": (
+            "CUDA events, MegaFold-layout inputs, all backward launches and "
+            "output conversions, median of repeat averages, matched rotating "
+            "pool and iteration count"
+        ),
+        "results": serialized_results,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _write_combined_json(
+    path: Path,
+    results: Sequence[CombinedBenchmarkResult],
+    args: argparse.Namespace,
+    *,
+    forward_compile_count: int,
+    backward_compile_count: int,
+) -> None:
+    serialized_results = []
+    for result in results:
+        serialized = asdict(result)
+        serialized.update(
+            speedup=result.speedup,
+            triton_tflops=result.triton_tflops,
+            cute_tflops=result.cute_tflops,
+        )
+        serialized_results.append(serialized)
+    execution = "eager launches" if args.eager_combined else "CUDA-graph replay"
+    payload = {
+        "direction": "combined",
+        "device": torch.cuda.get_device_name(torch.cuda.current_device()),
+        "head_dimension": args.head_dim,
+        "required_speedup": args.required_speedup,
+        "compile_count": {
+            "forward": forward_compile_count,
+            "backward": backward_compile_count,
+        },
+        "flops": (
+            "14*B*S*H*N^2*D algorithmic FLOPs: two forward and five "
+            "backward matrix products, counting each FMA as two FLOPs"
+        ),
+        "timing": (
+            "CUDA-event timing of dependent forward plus complete backward; "
+            f"execution={execution}; "
+            "preallocated input layouts, allocation, compilation, graph capture, "
+            "and warmup excluded; CuTe forward and backward share the model "
+            "layout without a bridge; Triton gradient output conversions included; "
+            "matched rotating address pool, iteration count, and "
+            "backward batch chunk"
+        ),
+        "results": serialized_results,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _run_backward_benchmark(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> None:
+    if __package__:
+        from .evoattention_cute_bwd import get_evoattention_backward
+    else:
+        from evoattention_cute_bwd import get_evoattention_backward
+
+    backward = get_evoattention_backward()
+    results: list[BackwardBenchmarkResult] = []
+    print(
+        f"{'B':>2} {'H':>3} {'D':>3} {'N=S':>5} {'slots':>5}  "
+        f"{'Triton ms':>11} {'CuTe ms':>11} {'speedup':>9}  "
+        f"{'CuTe TF/s':>10} {'iters':>6} {'pass':>5}"
+    )
+    print("-" * 108)
+    for shape in select_shapes(
+        quick=args.quick,
+        context_length=args.n,
+        batch_size=args.batch,
+        num_heads=args.heads,
+        head_dimension=args.head_dim,
+    ):
+        result = benchmark_backward_shape(
+            backward,
+            shape,
+            device=device,
+            warmup=args.warmup,
+            repeats=args.repeats,
+            target_ms=args.target_ms,
+            fixed_iters=args.iters,
+            seed=args.seed,
+        )
+        results.append(result)
+        passed = result.speedup >= args.required_speedup
+        print(
+            f"{result.batch_size:2d} {result.num_heads:3d} "
+            f"{result.head_dimension:3d} "
+            f"{result.context_length:5d} {result.pool_slots:5d}  "
+            f"{result.triton.median_ms:11.4f} "
+            f"{result.cute.median_ms:11.4f} {result.speedup:8.3f}x  "
+            f"{result.cute_tflops:10.2f} {result.cute.iterations:6d} "
+            f"{'yes' if passed else 'NO':>5}",
+            flush=True,
+        )
+
+    failures = [result for result in results if result.speedup < args.required_speedup]
+    print(
+        f"\nsummary: {len(results) - len(failures)}/{len(results)} shapes meet "
+        f"{args.required_speedup:.3f}x; CuTe compile_count={backward.compile_count}"
+    )
+    if backward.compile_count != 1:
+        raise AssertionError(
+            "backward must use one runtime-dynamic compiled artifact, got "
+            f"{backward.compile_count}"
+        )
+    if args.json is not None:
+        _write_backward_json(args.json, results, args, backward.compile_count)
+        print(f"wrote {args.json}")
+    if failures and not args.no_enforce:
+        failed = ", ".join(
+            f"B{result.batch_size}/H{result.num_heads}/D{result.head_dimension}/"
+            f"N{result.context_length}"
+            for result in failures
+        )
+        raise SystemExit(f"speed target missed for: {failed}")
+
+
+def _run_combined_benchmark(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> None:
+    if __package__:
+        from .evoattention_cute_bwd import get_evoattention_backward
+    else:
+        from evoattention_cute_bwd import get_evoattention_backward
+
+    forward = load_cute_forward()
+    backward = get_evoattention_backward()
+    results: list[CombinedBenchmarkResult] = []
+    _print_combined_header()
+    for shape in select_shapes(
+        quick=args.quick,
+        context_length=args.n,
+        batch_size=args.batch,
+        num_heads=args.heads,
+        head_dimension=args.head_dim,
+    ):
+        result = benchmark_combined_shape(
+            forward,
+            backward,
+            shape,
+            device=device,
+            warmup=args.warmup,
+            repeats=args.repeats,
+            target_ms=args.target_ms,
+            fixed_iters=args.iters,
+            seed=args.seed,
+            capture_graph=not args.eager_combined,
+        )
+        results.append(result)
+        _print_combined_result(result, args.required_speedup)
+
+    assert_single_compilation(forward)
+    if backward.compile_count != 1:
+        raise AssertionError(
+            "backward must use one runtime-dynamic compiled artifact, got "
+            f"{backward.compile_count}"
+        )
+    failures = [result for result in results if result.speedup < args.required_speedup]
+    print(
+        f"\nsummary: {len(results) - len(failures)}/{len(results)} shapes meet "
+        f"{args.required_speedup:.3f}x; CuTe compile_count="
+        f"forward:{forward.compile_count}, backward:{backward.compile_count}"
+    )
+    if args.json is not None:
+        _write_combined_json(
+            args.json,
+            results,
+            args,
+            forward_compile_count=forward.compile_count,
+            backward_compile_count=backward.compile_count,
+        )
+        print(f"wrote {args.json}")
+    if failures and not args.no_enforce:
+        failed = ", ".join(
+            f"B{result.batch_size}/H{result.num_heads}/D{result.head_dimension}/"
+            f"N{result.context_length}"
+            for result in failures
+        )
+        raise SystemExit(f"speed target missed for: {failed}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--direction",
+        choices=("combined", "forward", "backward"),
+        default="combined",
+    )
+    parser.add_argument("--quick", action="store_true", help="run three smoke shapes")
+    parser.add_argument("--n", type=int, choices=SEQUENCE_LENGTHS)
+    parser.add_argument("--batch", type=int, choices=(1, 4))
+    parser.add_argument("--heads", type=int, choices=(4, 16))
+    parser.add_argument(
+        "--head-dim",
+        "--d",
+        type=int,
+        choices=SUPPORTED_HEAD_DIMENSIONS,
+        default=32,
+        help="attention head dimension (default: 32)",
+    )
+    parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
+    parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
+    parser.add_argument(
+        "--target-ms",
+        type=float,
+        default=DEFAULT_TARGET_MS,
+        help="target duration of each repeat when --iters is omitted",
+    )
+    parser.add_argument("--iters", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--eager-combined",
+        action="store_true",
+        help=(
+            "launch each operation eagerly in combined mode instead of replaying "
+            "a pre-captured CUDA graph; this includes host enqueue gaps"
+        ),
+    )
+    parser.add_argument("--required-speedup", type=float, default=REQUIRED_SPEEDUP)
+    parser.add_argument(
+        "--no-enforce",
+        action="store_true",
+        help="report sub-2x shapes without returning failure",
+    )
+    parser.add_argument("--json", type=Path, default=None)
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required")
+    if args.iters is not None and args.iters < 1:
+        parser.error("--iters must be positive")
+    if args.warmup < 0 or args.repeats < 1 or args.target_ms <= 0:
+        parser.error("warmup must be nonnegative; repeats and target-ms positive")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    print(f"device: {torch.cuda.get_device_name(device)} ({device})")
+    print(f"head dimension: {args.head_dim}")
+    if args.direction == "combined":
+        print(
+            "timing: dependent forward + complete backward, preallocated inputs, "
+            f"{'eager launches' if args.eager_combined else 'CUDA-graph replay'}, "
+            "CUDA events, compile/allocation/warmup excluded"
+        )
+    elif args.direction == "backward":
+        print(
+            "timing: MegaFold-layout complete backward, CUDA events, "
+            "compile/allocation/warmup excluded"
+        )
+    else:
+        print(
+            "timing: MegaFold-layout inputs/output, CUDA-graph replay and CUDA "
+            "events; Triton pair-bias/Q/K/V/mask/output preparation included; "
+            "compile/allocation/capture/warmup excluded"
+        )
+    print(f"required speedup: {args.required_speedup:.3f}x on every selected shape\n")
+
+    if args.direction == "combined":
+        _run_combined_benchmark(args, device)
+        return
+    if args.direction == "backward":
+        _run_backward_benchmark(args, device)
+        return
+
+    forward = load_cute_forward()
+    results: list[BenchmarkResult] = []
+    _print_forward_header()
+    for shape in select_shapes(
+        quick=args.quick,
+        context_length=args.n,
+        batch_size=args.batch,
+        num_heads=args.heads,
+        head_dimension=args.head_dim,
+    ):
+        result = benchmark_shape(
+            forward,
+            shape,
+            device=device,
+            warmup=args.warmup,
+            repeats=args.repeats,
+            target_ms=args.target_ms,
+            fixed_iters=args.iters,
+            seed=args.seed,
+        )
+        results.append(result)
+        _print_forward_result(result, args.required_speedup)
+
+    assert_single_compilation(forward)
+    failures = [r for r in results if r.speedup < args.required_speedup]
+    print(
+        f"\nsummary: {len(results) - len(failures)}/{len(results)} shapes meet "
+        f"{args.required_speedup:.3f}x; CuTe compile_count={forward.compile_count}"
+    )
+    if args.json is not None:
+        _write_json(args.json, results, args)
+        print(f"wrote {args.json}")
+
+    if failures and not args.no_enforce:
+        failed = ", ".join(
+            f"B{result.batch_size}/H{result.num_heads}/D{result.head_dimension}/"
+            f"N{result.context_length}"
+            for result in failures
+        )
+        raise SystemExit(f"speed target missed for: {failed}")
+
+
+if __name__ == "__main__":
+    main()
