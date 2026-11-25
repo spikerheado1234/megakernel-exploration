@@ -1,6 +1,7 @@
 """Combined EvoAttention and sequence-parallel communication benchmark.
 
-The baseline preserves MegaFold's communication placement: one C-wide
+The baseline runs MegaFold's Triton EvoAttention (the ``TritonEvoformer``
+autograd op) and preserves MegaFold's communication placement: one C-wide
 row-to-column exchange after the forward computation and one inverse exchange
 before backward.  The CuTe path routes the raw attention output and residual
 input in its forward epilogue, then reconstructs dO and dX during backward
@@ -23,8 +24,7 @@ import nvshmem.core as nvshmem
 if __package__:
     from .benchmark_support import (
         column_to_row,
-        launch_triton_backward,
-        launch_triton_forward,
+        convert_mask,
         load_reference_module,
         measure_distributed,
         row_to_column,
@@ -38,8 +38,7 @@ if __package__:
 else:
     from benchmark_support import (
         column_to_row,
-        launch_triton_backward,
-        launch_triton_forward,
+        convert_mask,
         load_reference_module,
         measure_distributed,
         row_to_column,
@@ -175,36 +174,21 @@ def main() -> None:
         generator=generator,
     )
 
-    # Triton forward workspaces.  These copies reproduce the original wrapper's
-    # transpose-and-contiguous contract, including K/V compaction.
-    triton_internal_shape = (
-        args.batch,
-        sequence_count,
-        args.heads,
-        args.n,
-        HEAD_DIMENSION,
-    )
-    triton_query = torch.empty(
-        triton_internal_shape, dtype=torch.bfloat16, device="cuda"
-    )
-    triton_key_public = torch.empty_like(query)
-    triton_value_public = torch.empty_like(query)
-    triton_key = torch.empty_like(triton_query)
-    triton_value = torch.empty_like(triton_query)
-    triton_output = torch.empty_like(triton_query)
-    triton_output_public = torch.empty_like(query)
-    triton_lse = torch.empty(
-        (args.batch, sequence_count, args.heads, args.n),
-        dtype=torch.float32,
-        device="cuda",
-    )
+    # Triton baseline inputs.  The leaves share storage with the CuTe inputs, so
+    # autograd tracking never touches the CuTe path.  K and V remain strided
+    # views of one packed projection, exactly as the model passes them.
+    triton_query = query.detach().requires_grad_()
+    triton_key_value_storage = key_value_storage.detach().requires_grad_()
+    triton_key = triton_key_value_storage[:, :, :, 0]
+    triton_value = triton_key_value_storage[:, :, :, 1]
     triton_pair_bias = torch.empty(
-        (args.batch, args.heads, args.n, args.n),
+        (args.batch, 1, args.heads, args.n, args.n),
         dtype=torch.bfloat16,
         device="cuda",
+        requires_grad=True,
     )
     additive_mask = torch.empty(
-        (args.batch, sequence_count, args.n),
+        (args.batch, sequence_count, 1, 1, args.n),
         dtype=torch.float32,
         device="cuda",
     )
@@ -268,19 +252,7 @@ def main() -> None:
     reference_output_gradient = _all_gather_col_to_row_reference(
         local_column_output_gradient, rank, sequence_count
     )
-    triton_output_gradient = torch.empty_like(triton_output)
-    triton_delta = torch.empty_like(triton_lse)
-    triton_dq = torch.empty_like(triton_query)
-    triton_dk = torch.empty_like(triton_query)
-    triton_dv = torch.empty_like(triton_query)
     pair_shape = (args.batch, args.heads, args.n, args.n)
-    triton_dpb = torch.empty(pair_shape, dtype=torch.float32, device="cuda")
-    triton_dq_public = torch.empty_like(query)
-    triton_dk_public = torch.empty_like(query)
-    triton_dv_public = torch.empty_like(query)
-    triton_dpb_output = torch.empty(
-        pair_shape, dtype=torch.bfloat16, device="cuda"
-    )
 
     # CuTe forward output and synchronization buffers.
     cute_pair_bias = torch.empty(
@@ -289,7 +261,11 @@ def main() -> None:
         device="cuda",
     )
     cute_local_output = torch.empty_like(query)
-    cute_lse = torch.empty_like(triton_lse)
+    cute_lse = torch.empty(
+        (args.batch, sequence_count, args.heads, args.n),
+        dtype=torch.float32,
+        device="cuda",
+    )
     output_storage = nvshmem.tensor(
         (
             args.batch,
@@ -374,24 +350,20 @@ def main() -> None:
     )
     epoch = 0
 
+    triton_output: torch.Tensor | None = None
+    triton_gradients: tuple[torch.Tensor, ...] = ()
+
     def triton_forward_step() -> None:
-        triton_key_public.copy_(key)
-        triton_value_public.copy_(value)
-        launch_triton_forward(
-            reference,
-            query,
-            triton_key_public,
-            triton_value_public,
-            pair_bias_source,
-            residual_mask,
+        nonlocal triton_output
+        with torch.no_grad():
+            triton_pair_bias[:, 0].copy_(pair_bias_source)
+        convert_mask(residual_mask, additive_mask)
+        triton_output = reference.TritonEvoformer(
             triton_query,
             triton_key,
             triton_value,
-            triton_pair_bias,
             additive_mask,
-            triton_output,
-            triton_output_public,
-            triton_lse,
+            triton_pair_bias,
         )
 
     def baseline_forward_communication() -> None:
@@ -411,27 +383,15 @@ def main() -> None:
         )
 
     def triton_backward_step() -> None:
-        triton_output_gradient.copy_(reference_output_gradient.transpose(2, 3))
-        launch_triton_backward(
-            reference,
-            triton_query,
-            triton_key,
-            triton_value,
+        # autograd.grad returns fresh gradients instead of accumulating into
+        # .grad, and retain_graph lets the breakdown replay one forward graph.
+        nonlocal triton_gradients
+        triton_gradients = torch.autograd.grad(
             triton_output,
-            triton_output_gradient,
-            triton_pair_bias,
-            additive_mask,
-            triton_lse,
-            triton_delta,
-            triton_dq,
-            triton_dk,
-            triton_dv,
-            triton_dpb,
+            (triton_query, triton_key, triton_value, triton_pair_bias),
+            reference_output_gradient,
+            retain_graph=True,
         )
-        triton_dq_public.copy_(triton_dq.transpose(2, 3))
-        triton_dk_public.copy_(triton_dk.transpose(2, 3))
-        triton_dv_public.copy_(triton_dv.transpose(2, 3))
-        triton_dpb_output.copy_(triton_dpb)
 
     def baseline_step() -> None:
         triton_forward_step()
@@ -510,10 +470,11 @@ def main() -> None:
     torch.cuda.synchronize()
 
     if not args.skip_check:
+        triton_row_output = triton_output.detach()
         gathered_outputs = [
-            torch.empty_like(triton_output_public) for _ in range(world_size)
+            torch.empty_like(triton_row_output) for _ in range(world_size)
         ]
-        dist.all_gather(gathered_outputs, triton_output_public)
+        dist.all_gather(gathered_outputs, triton_row_output)
         expected_column_output = torch.cat(gathered_outputs, dim=1)[
             :, :, rank * sequence_count : (rank + 1) * sequence_count
         ]
@@ -562,11 +523,12 @@ def main() -> None:
             rtol=0,
             rank=rank,
         )
+        triton_dq, triton_dk, triton_dv, triton_dpb = triton_gradients
         for name, actual, expected in (
-            ("dQ", cute_dq, triton_dq_public),
-            ("dK", cute_dk, triton_dk_public),
-            ("dV", cute_dv, triton_dv_public),
-            ("dPairBias", cute_dpb_output, triton_dpb_output),
+            ("dQ", cute_dq, triton_dq),
+            ("dK", cute_dk, triton_dk),
+            ("dV", cute_dv, triton_dv),
+            ("dPairBias", cute_dpb_output, triton_dpb[:, 0]),
         ):
             _check_close(
                 name,
@@ -590,8 +552,8 @@ def main() -> None:
         print(
             f"B={args.batch} H={args.heads} N={args.n} D={HEAD_DIMENSION} "
             f"C={MODEL_DIMENSION} P={world_size} "
-            f"baseline={baseline_ms:.4f} ms cute={cute_ms:.4f} ms "
-            f"speedup={speedup:.3f}x target={'PASS' if speedup >= 2.5 else 'FAIL'}"
+            f"triton+nccl={baseline_ms:.4f} ms cute={cute_ms:.4f} ms "
+            f"speedup={speedup:.3f}x"
         )
 
     if args.breakdown:

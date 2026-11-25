@@ -12,7 +12,9 @@ The benchmark boundary is intentionally narrower than a complete MegaFold
 block. It compares:
 
 - baseline forward: model-layout preparation, Triton EvoAttention, then one
-  C=128 NCCL row-to-column All-to-All;
+  C=128 NCCL row-to-column All-to-All. The Triton baseline is MegaFold's
+  `TritonEvoformer` autograd op (`debug/evoattention.py`: 64x64 WGMMA tiles,
+  strided Q/K/V views); `EVOATTENTION_REFERENCE` overrides its path;
 - CuTe forward: EvoAttention plus remote-TMA resharding of both attention
   output and residual input;
 - baseline backward: one C=128 NCCL column-to-row All-to-All, then the full
@@ -65,7 +67,7 @@ prototype's timed boundary.
 
 ### 3.1 Attention mainloop
 
-The forward preserves the best single-GPU D=32 schedule:
+The forward uses the following D=32 schedule:
 
 | Quantity | Value |
 |---|---:|
@@ -73,9 +75,12 @@ The forward preserves the best single-GPU D=32 schedule:
 | key/value tile | 64 rows |
 | consumer warpgroups | 2 |
 | producer warps | 1 |
-| threads per CTA | 288 |
+| epilogue warps | 1 |
+| threads per CTA | 320 |
 | K/V stages | 3 |
-| pair-bias stages | 1 |
+| pair-bias stages | 2 |
+| Q / output staging buffers | 2 / 2 |
+| CTAs per SM (persistent grid) | 2 |
 | output transfer granularity | 16 rows |
 
 One producer warp feeds two 128-thread WGMMA consumers. The consumers work on
@@ -83,9 +88,39 @@ two adjacent sequence instances while sharing the same pair-bias tile. Query,
 key, value, mask, online-softmax state, and output accumulators remain private
 where their logical indices differ.
 
+The mainloop reads the pair-bias tile with non-transposed `ldmatrix` directly
+into the score-accumulator layout, and combines row maxima with `max.f32`
+(`cute.arch.fmax`) instead of the NaN-propagating `cutlass.max`, which lowers
+to a compare-and-select pair. Together these remove about 21% of the executed
+instructions.
+
+### 3.1.1 Persistent schedule
+
+The grid launches two CTAs per SM, and each CTA loops over the linear task
+space with a grid stride (`task = CTA + i * grid`), so the tasks resident at
+any moment are contiguous. Within a task index, heads vary fastest after the
+query block: Q/K/V store all heads of a token contiguously, and this order lets
+concurrently resident tasks share those rows in L2. A head-slowest order
+roughly doubled DRAM reads at H=16.
+
+Pipeline barriers are initialized once per CTA. K/V and pair-bias phases follow
+a CTA-wide pipeline block index, and Q and output phases follow the per-CTA
+task iteration, so the producer stages the next task's Q while the consumers
+finish the current task. A dedicated epilogue warp waits on the output staging
+buffer, issues the local and remote TMA stores, and releases the buffer through
+an mbarrier, so neither consumer warpgroup ever waits on TMA stores. The
+residual-input chunk `c` of a task is staged by the producer into its own tile
+and stored by the epilogue warp of the task whose head index is `c % H`, which
+spreads that traffic across heads.
+
+At P=1, compared with the previous non-persistent kernel, this schedule is
+1.45x faster at B=1, H=4, N=384, 1.43x at H=16, N=384, and 1.26x at H=4,
+N=640, with bit-identical output, LSE, peer output and residual copy.
+
 ### 3.2 Remote-TMA epilogue
 
-The output tile is divided into 16-row destination-aligned chunks. For each
+The epilogue warp divides the output tile into 16-row destination-aligned
+chunks. For each
 chunk, the rank owning that column range is known from the global query-row
 coordinate. TMA stores therefore target the appropriate symmetric peer view
 directly instead of first materializing row-sharded output and launching a
@@ -192,8 +227,38 @@ limited to H=16, N>=640, where atomics are the measured problem.
 
 ## 6. Representative combined results
 
+### 6.1 Persistent forward vs `TritonEvoformer` + NCCL
+
+`benchmark.py` with the persistent forward, H100, one process per GPU;
+combined forward + backward step, slowest rank:
+
+| B, H | N | P=2 | P=4 | P=8 |
+|---|---:|---:|---:|---:|
+| 1, 4 | 128 | 5.15x | 5.70x | 7.16x |
+| 1, 4 | 256 | 3.20x | 5.40x | 6.58x |
+| 1, 4 | 384 | 1.57x | 2.43x | 4.33x |
+| 1, 4 | 512 | 1.46x | 1.53x | 2.78x |
+| 1, 4 | 640 | 1.38x | 1.43x | 1.56x |
+| 1, 4 | 768 | 1.31x | 1.36x | 1.42x |
+| 1, 4 | 896 | 1.24x | 1.30x | 1.35x |
+| 1, 4 | 1024 | 1.28x | 1.27x | 1.29x |
+| 1, 16 | 384 | 1.25x | 1.33x | 1.47x |
+| 1, 16 | 1024 | 2.10x | 2.06x | 1.94x |
+| 4, 16 | 1024 | 1.99x | 2.07x | 1.92x |
+
+Below roughly 0.2 ms per rank the baseline is bounded by a fixed cost of about
+0.14 ms for the Triton forward and 0.2 ms for its backward, plus the NCCL
+exchanges, so the largest ratios mostly reflect launch and communication
+overhead. At H=16, N=1024 the Triton backward alone is 2.4x slower than the
+CuTe physical backward.
+
+### 6.2 Earlier development results
+
 These are representative development measurements, not a claim of a fresh
-post-refactor rerun. CUDA events measured the complete dependency chain and
+post-refactor rerun. They predate the persistent forward and were measured
+against the original upstream MegaFold Triton kernel
+(`megafold/model/FusedEvoAttention/evoattention.py`, 16-row query tiles), not
+the current `TritonEvoformer` baseline. CUDA events measured the complete dependency chain and
 the reported sample was reduced with `MAX` across ranks.
 
 | P | B | H | N | speedup vs Triton + NCCL |

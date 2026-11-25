@@ -17,6 +17,12 @@ Q/K/V, residual-mask, output, and softmax state. B, S, H, and N remain runtime
 dynamic, while D=32 and the tile schedule are static. The epilogue divides
 each M=64 output tile into M=16 TMA stores and routes those stores directly to
 the symmetric output allocation on the owning NVSHMEM PE.
+
+The grid is persistent: ``CTAS_PER_SM`` CTAs per SM loop over the linear task
+space with a grid stride, so the tasks resident at any moment are contiguous
+and share K/V and pair-bias tiles in L2. Q and output staging tiles are double
+buffered across tasks, and a dedicated epilogue warp drains the output and
+residual all-to-all stores so the consumers never wait on TMA stores.
 """
 
 from __future__ import annotations
@@ -46,18 +52,29 @@ CONSUMER_WARPGROUP_COUNT = 2
 THREADS_PER_WARPGROUP = 128
 CONSUMER_THREAD_COUNT = CONSUMER_WARPGROUP_COUNT * THREADS_PER_WARPGROUP
 PRODUCER_WARP_INDEX = 8
-THREADS_PER_BLOCK = CONSUMER_THREAD_COUNT + 32
+EPILOGUE_WARP_INDEX = 9
+# Two consumer warpgroups, one TMA producer warp and one epilogue warp.
+THREADS_PER_BLOCK = (EPILOGUE_WARP_INDEX + 1) * 32
 CTA_OUTPUT_ROW_SLOTS = CONSUMER_WARPGROUP_COUNT * QUERY_TILE_SIZE
 MAX_WORLD_SIZE = 8
 REMOTE_STORE_ROWS = 16
 SHORT_SEQUENCE_LENGTH = 2 * KEY_TILE_SIZE
 SOFTMAX_SCALE = 1.0 / math.sqrt(HEAD_DIMENSION)
 KEY_VALUE_STAGES = 3
-PAIR_BIAS_STAGES = 1
+# An even stage count keeps the consumers at <= 96 registers per thread, the
+# limit for two resident CTAs per SM.
+PAIR_BIAS_STAGES = 2
+CTAS_PER_SM = 2
+# The producer stages the next task's Q, and the epilogue warp drains the
+# previous task's output, while the consumers work on the current task.
+QUERY_BUFFERS = 2
+OUTPUT_BUFFERS = 2
+# Each task moves QUERY_TILE_SIZE residual-input rows in REMOTE_STORE_ROWS
+# chunks; chunk c is moved by the task whose head index equals c % H.
+RESIDUAL_CHUNKS = QUERY_TILE_SIZE // REMOTE_STORE_ROWS
 PAIR_BIAS_EVICT_LAST_POLICY = 0x14F0000000000000
 QK0_TO_QK1_BARRIER_ID = 3
 QK1_TO_PV0_BARRIER_ID = 4
-OUTPUT_READY_BARRIER_ID = 5
 
 
 def _as_dynamic_tensor(
@@ -98,6 +115,28 @@ def _as_dynamic_layout_tensor(
 
 
 @cute.jit
+def _decode_task(
+    task: cutlass.Int32,
+    query_blocks: cutlass.Int32,
+    heads: cutlass.Int32,
+    sequence_pairs: cutlass.Int32,
+):
+    """Map a linear task to ``(query_block, head_idx, sequence_0, batch_idx)``.
+
+    Heads vary fastest after the query block. Q/K/V store all heads of a token
+    contiguously, so concurrently resident tasks read the same rows and each
+    row is fetched from DRAM once.
+    """
+    query_block = task % query_blocks
+    head_linear = task // query_blocks
+    head_idx = head_linear % heads
+    pair_batch = head_linear // heads
+    sequence_0 = (pair_batch % sequence_pairs) * CONSUMER_WARPGROUP_COUNT
+    batch_idx = pair_batch // sequence_pairs
+    return query_block, head_idx, sequence_0, batch_idx
+
+
+@cute.jit
 def _store_remote_output_chunk(
     output_tma: cute.CopyAtom,
     output_tensor: cute.Tensor,
@@ -108,8 +147,13 @@ def _store_remote_output_chunk(
     head_idx: cutlass.Int32,
     sequence_0: cutlass.Int32,
     batch_idx: cutlass.Int32,
+    buffer: cutlass.Int32,
 ):
-    """Store one destination-aligned chunk for both consumer warpgroups."""
+    """Store one destination-aligned chunk for both consumer warpgroups.
+
+    ``buffer`` selects the output staging tile (CONSUMER_WARPGROUP_COUNT
+    M=64 slots per buffer).
+    """
     output_tiles = cute.zipped_divide(
         output_tensor, (HEAD_DIMENSION, store_rows)
     )
@@ -120,15 +164,16 @@ def _store_remote_output_chunk(
         None, (0, None, head_idx, sequence_0 + 1, batch_idx)
     ]
     chunks_per_consumer = QUERY_TILE_SIZE // store_rows
+    buffer_base = buffer * (CONSUMER_WARPGROUP_COUNT * chunks_per_consumer)
     shared_output_0 = cute.local_tile(
         shared_output,
         (HEAD_DIMENSION, store_rows),
-        (0, chunk),
+        (0, buffer_base + chunk),
     )
     shared_output_1 = cute.local_tile(
         shared_output,
         (HEAD_DIMENSION, store_rows),
-        (0, chunks_per_consumer + chunk),
+        (0, buffer_base + chunks_per_consumer + chunk),
     )
     shared_partition_0, global_partition_0 = cute.nvgpu.cpasync.tma_partition(
         output_tma,
@@ -304,11 +349,13 @@ def _evoattention_forward_kernel(
     output_mma: cute.TiledMma,
     output_register_copy: cute.TiledCopy,
     world_size: cutlass.Constexpr[int],
+    cta_count: cutlass.Constexpr[int],
 ):
-    """Run the warp-specialized SM90 forward pass.
+    """Run the warp-specialized, persistent SM90 forward pass.
 
-    Warps 0-7 form two consumer warpgroups. Warp 8 is the sole TMA producer.
-    Each consumer owns one sequence's M=64 query tile and a three-stage K/V
+    Warps 0-7 form two consumer warpgroups. Warp 8 is the sole TMA producer
+    and warp 9 issues the output and residual TMA stores. For each task, each
+    consumer owns one sequence's M=64 query tile and a three-stage K/V
     pipeline; both consumers reuse one pair-bias tile.
     """
     thread_idx, _, _ = cute.arch.thread_idx()
@@ -320,13 +367,12 @@ def _evoattention_forward_kernel(
     batch = q.shape[4]
     query_blocks = n_ctx // QUERY_TILE_SIZE
     sequence_pairs = sequence_count // CONSUMER_WARPGROUP_COUNT
-    query_block = linear_block % query_blocks
-    sequence_pair_linear = linear_block // query_blocks
-    sequence_pair = sequence_pair_linear % sequence_pairs
-    batch_head_idx = sequence_pair_linear // sequence_pairs
-    batch_idx = batch_head_idx // heads
-    head_idx = batch_head_idx % heads
-    sequence_0 = sequence_pair * CONSUMER_WARPGROUP_COUNT
+    # Tasks are assigned with a grid stride (task = CTA + i * cta_count) so the
+    # tasks resident at any moment are contiguous. Pipeline barriers are never
+    # re-initialized between tasks: K/V and pair-bias phases follow the
+    # CTA-wide pipeline block index, and Q/output phases the task iteration.
+    total_tasks = query_blocks * sequence_pairs * batch * heads
+    task_iterations = (total_tasks - linear_block + cta_count - 1) // cta_count
 
     allocator = cutlass.utils.SmemAllocator()
     shared_query = allocator.allocate_tensor(
@@ -369,30 +415,54 @@ def _evoattention_forward_kernel(
         output_layout.outer,
         swizzle=output_layout.inner,
     )
-    # Once the attention output has been issued to TMA, reinterpret the same
-    # 8 KiB allocation as two [C=128, M=16] residual-input tiles.
-    shared_residual_input = cute.make_tensor(
-        shared_output.iterator,
+    # Residual-input staging tile (two [C=128, M=16] chunks, one per sequence
+    # of the pair), filled by the producer warp and drained by the epilogue
+    # warp.
+    shared_residual_input = allocator.allocate_tensor(
+        cutlass.BFloat16,
         residual_io_layout.outer,
+        swizzle=residual_io_layout.inner,
     )
-    query_ready = allocator.allocate_array(cutlass.Int64, CONSUMER_WARPGROUP_COUNT)
+    # One Q slot per consumer per Q buffer; task iteration i uses buffer
+    # i % QUERY_BUFFERS.
+    query_ready = allocator.allocate_array(
+        cutlass.Int64, CONSUMER_WARPGROUP_COUNT * QUERY_BUFFERS
+    )
+    query_free = allocator.allocate_array(cutlass.Int64, QUERY_BUFFERS)
     key_value_ready = allocator.allocate_array(cutlass.Int64, KEY_VALUE_STAGES)
     key_value_free = allocator.allocate_array(cutlass.Int64, KEY_VALUE_STAGES)
     pair_bias_ready = allocator.allocate_array(
         cutlass.Int64, PAIR_BIAS_STAGES
     )
     pair_bias_free = allocator.allocate_array(cutlass.Int64, PAIR_BIAS_STAGES)
+    # Residual staging: producer TMA -> residual_full -> epilogue warp stores
+    # -> residual_empty -> producer may refill.
+    residual_full = allocator.allocate_array(cutlass.Int64, 1)
+    residual_empty = allocator.allocate_array(cutlass.Int64, 1)
+    # Output staging hand-off per buffer: all consumer threads arrive on
+    # output_full; the epilogue warp arrives on output_empty once its TMA
+    # stores have finished reading that buffer.
+    output_full = allocator.allocate_array(cutlass.Int64, OUTPUT_BUFFERS)
+    output_empty = allocator.allocate_array(cutlass.Int64, OUTPUT_BUFFERS)
 
     if thread_idx == 0:
-        for consumer in cutlass.range_constexpr(CONSUMER_WARPGROUP_COUNT):
-            cute.arch.mbarrier_init(query_ready + consumer, 1)
+        for slot in cutlass.range_constexpr(
+            CONSUMER_WARPGROUP_COUNT * QUERY_BUFFERS
+        ):
+            cute.arch.mbarrier_init(query_ready + slot, 1)
+        for buffer in cutlass.range_constexpr(QUERY_BUFFERS):
+            cute.arch.mbarrier_init(query_free + buffer, CONSUMER_WARPGROUP_COUNT)
+        cute.arch.mbarrier_init(residual_full, 1)
+        cute.arch.mbarrier_init(residual_empty, 1)
+        for buffer in cutlass.range_constexpr(OUTPUT_BUFFERS):
+            cute.arch.mbarrier_init(output_full + buffer, CONSUMER_THREAD_COUNT)
+            cute.arch.mbarrier_init(output_empty + buffer, 1)
         for stage in cutlass.range_constexpr(KEY_VALUE_STAGES):
             cute.arch.mbarrier_init(key_value_ready + stage, 1)
             # One arrival from each consumer warpgroup releases a stage.
-            if n_ctx != SHORT_SEQUENCE_LENGTH:
-                cute.arch.mbarrier_init(
-                    key_value_free + stage, CONSUMER_WARPGROUP_COUNT
-                )
+            cute.arch.mbarrier_init(
+                key_value_free + stage, CONSUMER_WARPGROUP_COUNT
+            )
         for slot in cutlass.range_constexpr(PAIR_BIAS_STAGES):
             cute.arch.mbarrier_init(pair_bias_ready + slot, 1)
             # Every consumer warp arrives after copying its PB fragment to
@@ -415,224 +485,267 @@ def _evoattention_forward_kernel(
     cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
 
-    query_tiles = cute.zipped_divide(q, (QUERY_TILE_SIZE, HEAD_DIMENSION))
-    query_problem_0 = query_tiles[
-        None, (None, 0, head_idx, sequence_0, batch_idx)
-    ]
-    query_problem_1 = query_tiles[
-        None, (None, 0, head_idx, sequence_0 + 1, batch_idx)
-    ]
-    shared_query_partition, global_query_partition_0 = cute.nvgpu.cpasync.tma_partition(
-        query_tma,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(shared_query, 0, 2),
-        query_problem_0,
-    )
-    _, global_query_partition_1 = cute.nvgpu.cpasync.tma_partition(
-        query_tma,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(shared_query, 0, 2),
-        query_problem_1,
-    )
-    key_tiles = cute.zipped_divide(k, (KEY_TILE_SIZE, HEAD_DIMENSION))
-    key_problem_0 = key_tiles[None, (None, 0, head_idx, sequence_0, batch_idx)]
-    key_problem_1 = key_tiles[
-        None, (None, 0, head_idx, sequence_0 + 1, batch_idx)
-    ]
-    shared_key_partition, global_key_partition_0 = cute.nvgpu.cpasync.tma_partition(
-        key_tma,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(shared_key, 0, 2),
-        key_problem_0,
-    )
-    _, global_key_partition_1 = cute.nvgpu.cpasync.tma_partition(
-        key_tma,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(shared_key, 0, 2),
-        key_problem_1,
-    )
-    value_tiles = cute.zipped_divide(v, (HEAD_DIMENSION, KEY_TILE_SIZE))
-    value_problem_0 = value_tiles[None, (0, None, head_idx, sequence_0, batch_idx)]
-    value_problem_1 = value_tiles[
-        None, (0, None, head_idx, sequence_0 + 1, batch_idx)
-    ]
-    shared_value_partition, global_value_partition_0 = cute.nvgpu.cpasync.tma_partition(
-        value_tma,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(shared_value, 0, 2),
-        value_problem_0,
-    )
-    _, global_value_partition_1 = cute.nvgpu.cpasync.tma_partition(
-        value_tma,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(shared_value, 0, 2),
-        value_problem_1,
-    )
-    pair_bias_tiles = cute.zipped_divide(
-        pair_bias_tensor, (KEY_TILE_SIZE, QUERY_TILE_SIZE)
-    )
-    pair_bias_problem = pair_bias_tiles[
-        None, (None, None, head_idx, batch_idx)
-    ]
-    shared_pair_bias_partition, global_pair_bias_partition = (
-        cute.nvgpu.cpasync.tma_partition(
-            pair_bias_tma,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(shared_pair_bias, 0, 2),
-            pair_bias_problem,
-        )
-    )
-    residual_mask_tiles = cute.zipped_divide(residual_mask_tensor, (KEY_TILE_SIZE,))
-    residual_mask_problem_0 = residual_mask_tiles[
-        None, (None, sequence_0, batch_idx)
-    ]
-    residual_mask_problem_1 = residual_mask_tiles[
-        None, (None, sequence_0 + 1, batch_idx)
-    ]
-    shared_mask_partition, global_mask_partition_0 = cute.nvgpu.cpasync.tma_partition(
-        residual_mask_tma,
-        0,
-        cute.make_layout(1),
-        shared_mask,
-        residual_mask_problem_0,
-    )
-    _, global_mask_partition_1 = cute.nvgpu.cpasync.tma_partition(
-        residual_mask_tma,
-        0,
-        cute.make_layout(1),
-        shared_mask,
-        residual_mask_problem_1,
-    )
     num_key_blocks = n_ctx // KEY_TILE_SIZE
 
     if warp_idx == PRODUCER_WARP_INDEX:
         warpgroup_thread_idx = thread_idx - CONSUMER_THREAD_COUNT
-
-        # One warp owns producer control flow. The CuTe TMA copy atom has a
-        # one-thread logical copy layout, so this warp-uniform call does not
-        # create 32 independent transfers. Lane 0 also programs expected bytes.
-        if warpgroup_thread_idx == 0:
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                query_ready, QUERY_TILE_SIZE * HEAD_DIMENSION * 2
+        residual_count = cutlass.Int32(0)
+        for task_iteration in cutlass.range(task_iterations):
+            task = linear_block + task_iteration * cta_count
+            query_block, head_idx, sequence_0, batch_idx = _decode_task(
+                task, query_blocks, heads, sequence_pairs
             )
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                query_ready + 1, QUERY_TILE_SIZE * HEAD_DIMENSION * 2
-            )
-        cute.copy(
-            query_tma,
-            global_query_partition_0[None, query_block],
-            shared_query_partition[None, 0],
-            tma_bar_ptr=query_ready,
-        )
-        cute.copy(
-            query_tma,
-            global_query_partition_1[None, query_block],
-            shared_query_partition[None, 1],
-            tma_bar_ptr=query_ready + 1,
-        )
 
-        key_block = cutlass.Int32(0)
-        for _ in cutlass.range(num_key_blocks):
-            stage = key_block % KEY_VALUE_STAGES
-            if key_block >= KEY_VALUE_STAGES:
-                free_phase = ((key_block // KEY_VALUE_STAGES) - 1) % 2
-                cute.arch.mbarrier_wait(key_value_free + stage, free_phase)
-            pair_bias_stage = key_block % PAIR_BIAS_STAGES
-            if key_block >= PAIR_BIAS_STAGES:
-                pair_bias_free_phase = (
-                    (key_block // PAIR_BIAS_STAGES) - 1
-                ) % 2
-                cute.arch.mbarrier_wait(
-                    pair_bias_free + pair_bias_stage,
-                    pair_bias_free_phase,
+            query_tiles = cute.zipped_divide(q, (QUERY_TILE_SIZE, HEAD_DIMENSION))
+            query_problem_0 = query_tiles[
+                None, (None, 0, head_idx, sequence_0, batch_idx)
+            ]
+            query_problem_1 = query_tiles[
+                None, (None, 0, head_idx, sequence_0 + 1, batch_idx)
+            ]
+            shared_query_partition, global_query_partition_0 = cute.nvgpu.cpasync.tma_partition(
+                query_tma,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(shared_query, 0, 2),
+                query_problem_0,
+            )
+            _, global_query_partition_1 = cute.nvgpu.cpasync.tma_partition(
+                query_tma,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(shared_query, 0, 2),
+                query_problem_1,
+            )
+            key_tiles = cute.zipped_divide(k, (KEY_TILE_SIZE, HEAD_DIMENSION))
+            key_problem_0 = key_tiles[None, (None, 0, head_idx, sequence_0, batch_idx)]
+            key_problem_1 = key_tiles[
+                None, (None, 0, head_idx, sequence_0 + 1, batch_idx)
+            ]
+            shared_key_partition, global_key_partition_0 = cute.nvgpu.cpasync.tma_partition(
+                key_tma,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(shared_key, 0, 2),
+                key_problem_0,
+            )
+            _, global_key_partition_1 = cute.nvgpu.cpasync.tma_partition(
+                key_tma,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(shared_key, 0, 2),
+                key_problem_1,
+            )
+            value_tiles = cute.zipped_divide(v, (HEAD_DIMENSION, KEY_TILE_SIZE))
+            value_problem_0 = value_tiles[None, (0, None, head_idx, sequence_0, batch_idx)]
+            value_problem_1 = value_tiles[
+                None, (0, None, head_idx, sequence_0 + 1, batch_idx)
+            ]
+            shared_value_partition, global_value_partition_0 = cute.nvgpu.cpasync.tma_partition(
+                value_tma,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(shared_value, 0, 2),
+                value_problem_0,
+            )
+            _, global_value_partition_1 = cute.nvgpu.cpasync.tma_partition(
+                value_tma,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(shared_value, 0, 2),
+                value_problem_1,
+            )
+            pair_bias_tiles = cute.zipped_divide(
+                pair_bias_tensor, (KEY_TILE_SIZE, QUERY_TILE_SIZE)
+            )
+            pair_bias_problem = pair_bias_tiles[
+                None, (None, None, head_idx, batch_idx)
+            ]
+            shared_pair_bias_partition, global_pair_bias_partition = (
+                cute.nvgpu.cpasync.tma_partition(
+                    pair_bias_tma,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(shared_pair_bias, 0, 2),
+                    pair_bias_problem,
                 )
+            )
+            residual_mask_tiles = cute.zipped_divide(residual_mask_tensor, (KEY_TILE_SIZE,))
+            residual_mask_problem_0 = residual_mask_tiles[
+                None, (None, sequence_0, batch_idx)
+            ]
+            residual_mask_problem_1 = residual_mask_tiles[
+                None, (None, sequence_0 + 1, batch_idx)
+            ]
+            shared_mask_partition, global_mask_partition_0 = cute.nvgpu.cpasync.tma_partition(
+                residual_mask_tma,
+                0,
+                cute.make_layout(1),
+                shared_mask,
+                residual_mask_problem_0,
+            )
+            _, global_mask_partition_1 = cute.nvgpu.cpasync.tma_partition(
+                residual_mask_tma,
+                0,
+                cute.make_layout(1),
+                shared_mask,
+                residual_mask_problem_1,
+            )
+
+            query_buffer = task_iteration % QUERY_BUFFERS
+            query_slot = query_buffer * CONSUMER_WARPGROUP_COUNT
+            if task_iteration >= QUERY_BUFFERS:
+                cute.arch.mbarrier_wait(
+                    query_free + query_buffer,
+                    ((task_iteration // QUERY_BUFFERS) - 1) % 2,
+                )
+            # One warp owns producer control flow. The CuTe TMA copy atom has
+            # a one-thread logical copy layout, so this warp-uniform call does
+            # not create 32 independent transfers. Lane 0 programs the bytes.
             if warpgroup_thread_idx == 0:
                 cute.arch.mbarrier_arrive_and_expect_tx(
-                    key_value_ready + stage,
-                    CONSUMER_WARPGROUP_COUNT
-                    * (
-                        2 * KEY_TILE_SIZE * HEAD_DIMENSION * 2
-                        + KEY_TILE_SIZE * 2
-                    ),
+                    query_ready + query_slot, QUERY_TILE_SIZE * HEAD_DIMENSION * 2
                 )
                 cute.arch.mbarrier_arrive_and_expect_tx(
-                    pair_bias_ready + pair_bias_stage,
-                    QUERY_TILE_SIZE * KEY_TILE_SIZE * 2,
+                    query_ready + query_slot + 1,
+                    QUERY_TILE_SIZE * HEAD_DIMENSION * 2,
                 )
             cute.copy(
-                key_tma,
-                global_key_partition_0[None, key_block],
-                shared_key_partition[None, stage],
-                tma_bar_ptr=key_value_ready + stage,
+                query_tma,
+                global_query_partition_0[None, query_block],
+                shared_query_partition[None, query_slot],
+                tma_bar_ptr=query_ready + query_slot,
             )
             cute.copy(
-                key_tma,
-                global_key_partition_1[None, key_block],
-                shared_key_partition[None, KEY_VALUE_STAGES + stage],
-                tma_bar_ptr=key_value_ready + stage,
+                query_tma,
+                global_query_partition_1[None, query_block],
+                shared_query_partition[None, query_slot + 1],
+                tma_bar_ptr=query_ready + query_slot + 1,
             )
-            cute.copy(
-                value_tma,
-                global_value_partition_0[None, key_block],
-                shared_value_partition[None, stage],
-                tma_bar_ptr=key_value_ready + stage,
-            )
-            cute.copy(
-                value_tma,
-                global_value_partition_1[None, key_block],
-                shared_value_partition[None, KEY_VALUE_STAGES + stage],
-                tma_bar_ptr=key_value_ready + stage,
-            )
-            cute.copy(
-                residual_mask_tma,
-                global_mask_partition_0[None, key_block],
-                shared_mask_partition[None, stage],
-                tma_bar_ptr=key_value_ready + stage,
-            )
-            cute.copy(
-                residual_mask_tma,
-                global_mask_partition_1[None, key_block],
-                shared_mask_partition[None, KEY_VALUE_STAGES + stage],
-                tma_bar_ptr=key_value_ready + stage,
-            )
-            cute.copy(
-                pair_bias_tma,
-                global_pair_bias_partition[None, key_block, query_block],
-                shared_pair_bias_partition[None, pair_bias_stage],
-                tma_bar_ptr=pair_bias_ready + pair_bias_stage,
-                cache_policy=cutlass.Int64(PAIR_BIAS_EVICT_LAST_POLICY),
-            )
-            if key_block + KEY_VALUE_STAGES < num_key_blocks:
-                cute.prefetch(
-                    key_tma,
-                    global_key_partition_0[None, key_block + KEY_VALUE_STAGES],
-                )
-                cute.prefetch(
-                    value_tma,
-                    global_value_partition_0[None, key_block + KEY_VALUE_STAGES],
-                )
-                cute.prefetch(
-                    key_tma,
-                    global_key_partition_1[None, key_block + KEY_VALUE_STAGES],
-                )
-                cute.prefetch(
-                    value_tma,
-                    global_value_partition_1[None, key_block + KEY_VALUE_STAGES],
-                )
-            key_block += 1
 
-    else:
+            for key_block in cutlass.range(num_key_blocks):
+                pipeline_block = task_iteration * num_key_blocks + key_block
+                stage = pipeline_block % KEY_VALUE_STAGES
+                if pipeline_block >= KEY_VALUE_STAGES:
+                    free_phase = ((pipeline_block // KEY_VALUE_STAGES) - 1) % 2
+                    cute.arch.mbarrier_wait(key_value_free + stage, free_phase)
+                pair_bias_stage = pipeline_block % PAIR_BIAS_STAGES
+                if pipeline_block >= PAIR_BIAS_STAGES:
+                    pair_bias_free_phase = (
+                        (pipeline_block // PAIR_BIAS_STAGES) - 1
+                    ) % 2
+                    cute.arch.mbarrier_wait(
+                        pair_bias_free + pair_bias_stage,
+                        pair_bias_free_phase,
+                    )
+                if warpgroup_thread_idx == 0:
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        key_value_ready + stage,
+                        CONSUMER_WARPGROUP_COUNT
+                        * (
+                            2 * KEY_TILE_SIZE * HEAD_DIMENSION * 2
+                            + KEY_TILE_SIZE * 2
+                        ),
+                    )
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        pair_bias_ready + pair_bias_stage,
+                        QUERY_TILE_SIZE * KEY_TILE_SIZE * 2,
+                    )
+                cute.copy(
+                    key_tma,
+                    global_key_partition_0[None, key_block],
+                    shared_key_partition[None, stage],
+                    tma_bar_ptr=key_value_ready + stage,
+                )
+                cute.copy(
+                    key_tma,
+                    global_key_partition_1[None, key_block],
+                    shared_key_partition[None, KEY_VALUE_STAGES + stage],
+                    tma_bar_ptr=key_value_ready + stage,
+                )
+                cute.copy(
+                    value_tma,
+                    global_value_partition_0[None, key_block],
+                    shared_value_partition[None, stage],
+                    tma_bar_ptr=key_value_ready + stage,
+                )
+                cute.copy(
+                    value_tma,
+                    global_value_partition_1[None, key_block],
+                    shared_value_partition[None, KEY_VALUE_STAGES + stage],
+                    tma_bar_ptr=key_value_ready + stage,
+                )
+                cute.copy(
+                    residual_mask_tma,
+                    global_mask_partition_0[None, key_block],
+                    shared_mask_partition[None, stage],
+                    tma_bar_ptr=key_value_ready + stage,
+                )
+                cute.copy(
+                    residual_mask_tma,
+                    global_mask_partition_1[None, key_block],
+                    shared_mask_partition[None, KEY_VALUE_STAGES + stage],
+                    tma_bar_ptr=key_value_ready + stage,
+                )
+                cute.copy(
+                    pair_bias_tma,
+                    global_pair_bias_partition[None, key_block, query_block],
+                    shared_pair_bias_partition[None, pair_bias_stage],
+                    tma_bar_ptr=pair_bias_ready + pair_bias_stage,
+                    cache_policy=cutlass.Int64(PAIR_BIAS_EVICT_LAST_POLICY),
+                )
+                if key_block + KEY_VALUE_STAGES < num_key_blocks:
+                    cute.prefetch(
+                        key_tma,
+                        global_key_partition_0[None, key_block + KEY_VALUE_STAGES],
+                    )
+                    cute.prefetch(
+                        value_tma,
+                        global_value_partition_0[
+                            None, key_block + KEY_VALUE_STAGES
+                        ],
+                    )
+                    cute.prefetch(
+                        key_tma,
+                        global_key_partition_1[None, key_block + KEY_VALUE_STAGES],
+                    )
+                    cute.prefetch(
+                        value_tma,
+                        global_value_partition_1[
+                            None, key_block + KEY_VALUE_STAGES
+                        ],
+                    )
+
+            # Stage this task's residual-input chunks after its last K/V block
+            # so they never delay K/V.
+            for chunk in cutlass.range_constexpr(RESIDUAL_CHUNKS):
+                if cutlass.Int32(chunk) % heads == head_idx:
+                    if residual_count >= 1:
+                        cute.arch.mbarrier_wait(
+                            residual_empty, (residual_count - 1) % 2
+                        )
+                    if warpgroup_thread_idx == 0:
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            residual_full,
+                            CONSUMER_WARPGROUP_COUNT
+                            * RESIDUAL_DIMENSION
+                            * REMOTE_STORE_ROWS
+                            * 2,
+                        )
+                    _load_residual_chunk(
+                        residual_input_tma,
+                        residual_input_tensor,
+                        shared_residual_input,
+                        query_block * RESIDUAL_CHUNKS + chunk,
+                        sequence_0,
+                        batch_idx,
+                        residual_full,
+                    )
+                    residual_count += 1
+
+    elif warp_idx < PRODUCER_WARP_INDEX:
         consumer_warpgroup = thread_idx // THREADS_PER_WARPGROUP
         warpgroup_thread_idx = thread_idx - consumer_warpgroup * THREADS_PER_WARPGROUP
-        query_base = query_block * QUERY_TILE_SIZE
-        cute.arch.mbarrier_wait(query_ready + consumer_warpgroup, 0)
         qk_thread = score_mma.get_slice(warpgroup_thread_idx)
         query_fragment = score_mma.make_fragment_A(qk_thread.partition_A(shared_query))
         key_fragment = score_mma.make_fragment_B(qk_thread.partition_B(shared_key))
@@ -642,10 +755,10 @@ def _evoattention_forward_kernel(
         score_coords = qk_thread.partition_C(
             cute.make_identity_tensor((QUERY_TILE_SIZE, KEY_TILE_SIZE))
         )
-        # PB is staged in transposed MN-major form.  Reversing the two logical
-        # axes here recovers [row,col], while partition_C gives the same vector
-        # ownership as the score accumulator and avoids scalar bank-conflicted
-        # LDS instructions.
+        # PB is staged in transposed MN-major form. Reversing the two logical
+        # axes recovers [row, col], whose rows are contiguous in shared memory,
+        # so non-transposed ldmatrix loads it directly into the score
+        # accumulator layout.
         shared_pair_bias_row_col = cute.make_tensor(
             shared_pair_bias.iterator,
             cute.select(shared_pair_bias.layout, mode=[1, 0, 2]),
@@ -653,6 +766,14 @@ def _evoattention_forward_kernel(
         pair_bias_fragment = score_mma.make_fragment_C(
             score_mma.partition_shape_C((QUERY_TILE_SIZE, KEY_TILE_SIZE))
         )
+        pair_bias_load_atom = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            cutlass.BFloat16,
+        )
+        pair_bias_tiled_copy = cute.make_tiled_copy_C(pair_bias_load_atom, score_mma)
+        pair_bias_thread_copy = pair_bias_tiled_copy.get_slice(warpgroup_thread_idx)
+        pair_bias_bf16 = cute.make_fragment_like(pair_bias_fragment, cutlass.BFloat16)
+        pair_bias_bf16_retile = pair_bias_thread_copy.retile(pair_bias_bf16)
 
         pv_thread = output_mma.get_slice(warpgroup_thread_idx)
         probability_fragment = output_mma.make_fragment_A(
@@ -662,24 +783,13 @@ def _evoattention_forward_kernel(
         output_accumulator = output_mma.make_fragment_C(
             output_mma.partition_shape_C((QUERY_TILE_SIZE, HEAD_DIMENSION))
         )
-        output_accumulator.fill(0.0)
         shared_output_mn = cute.make_tensor(
             shared_output.iterator, cute.select(shared_output.layout, mode=[1, 0])
         )
-        shared_output_consumer = cute.local_tile(
-            shared_output_mn,
-            (QUERY_TILE_SIZE, HEAD_DIMENSION),
-            (consumer_warpgroup, 0),
-        )
         thread_copy_c = output_register_copy.get_slice(warpgroup_thread_idx)
-        output_partition = thread_copy_c.partition_D(shared_output_consumer)
 
         first_row, _ = score_coords[0]
         second_row, _ = score_coords[2]
-        running_max_0 = cutlass.Float32(float("-inf"))
-        running_max_1 = cutlass.Float32(float("-inf"))
-        running_sum_0 = cutlass.Float32(0.0)
-        running_sum_1 = cutlass.Float32(0.0)
         qk0_to_qk1 = NamedBarrier(
             barrier_id=QK0_TO_QK1_BARRIER_ID,
             num_threads=CONSUMER_THREAD_COUNT,
@@ -688,204 +798,253 @@ def _evoattention_forward_kernel(
             barrier_id=QK1_TO_PV0_BARRIER_ID,
             num_threads=CONSUMER_THREAD_COUNT,
         )
-
-        key_block = cutlass.Int32(0)
-        for _ in cutlass.range(num_key_blocks):
-            stage = key_block % KEY_VALUE_STAGES
-            key_value_slot = consumer_warpgroup * KEY_VALUE_STAGES + stage
-            full_phase = (key_block // KEY_VALUE_STAGES) % 2
-            pair_bias_stage = key_block % PAIR_BIAS_STAGES
-            pair_bias_phase = (key_block // PAIR_BIAS_STAGES) % 2
-
-            cute.arch.mbarrier_wait(key_value_ready + stage, full_phase)
-            # Diagonal FA3 ping-pong. WG1's QK(k) follows WG0's QK(k).
-            # Later, WG1's PV(k) waits for WG0's QK(k+1), allowing the latter
-            # to overlap WG1's softmax(k).
-            # Delay only the first QK; the producer independently stages the
-            # pair-bias tile shared by both consumers.
-            if (
-                n_ctx != SHORT_SEQUENCE_LENGTH
-                and consumer_warpgroup == 1
-                and key_block == 0
-            ):
-                qk0_to_qk1.arrive_and_wait()
-            score_mma.set(Field.ACCUMULATE, False)
-            cute.nvgpu.warpgroup.fence()
-            cute.gemm(
-                score_mma,
-                score_fragment,
-                query_fragment[None, None, None, consumer_warpgroup],
-                key_fragment[None, None, None, key_value_slot],
-                score_fragment,
+        for task_iteration in cutlass.range(task_iterations):
+            task = linear_block + task_iteration * cta_count
+            query_block, head_idx, sequence_0, batch_idx = _decode_task(
+                task, query_blocks, heads, sequence_pairs
             )
-            cute.nvgpu.warpgroup.commit_group()
-            cute.nvgpu.warpgroup.wait_group(0)
-            if n_ctx != SHORT_SEQUENCE_LENGTH:
-                if consumer_warpgroup == 0:
-                    qk0_to_qk1.arrive()
-                else:
-                    qk1_to_pv0.arrive()
+            query_base = query_block * QUERY_TILE_SIZE
+            query_buffer = task_iteration % QUERY_BUFFERS
+            query_slot = query_buffer * CONSUMER_WARPGROUP_COUNT + consumer_warpgroup
             cute.arch.mbarrier_wait(
-                pair_bias_ready + pair_bias_stage, pair_bias_phase
+                query_ready + query_slot, (task_iteration // QUERY_BUFFERS) % 2
             )
-            pair_bias_partition = qk_thread.partition_C(
-                shared_pair_bias_row_col[None, None, pair_bias_stage]
-            )
-            pair_bias_fragment.store(pair_bias_partition.load())
-            if warpgroup_thread_idx % 32 == 0:
-                cute.arch.mbarrier_arrive(pair_bias_free + pair_bias_stage)
 
-            local_max_0 = cutlass.Float32(float("-inf"))
-            local_max_1 = cutlass.Float32(float("-inf"))
-            # e and e+2 own the same key column for the two query rows in a
-            # four-lane WGMMA quartet.  Load the zero-stride broadcast mask
-            # once per column and fold the additive work into the max pass.
-            for group in cutlass.range_constexpr(cute.size(score_fragment) // 4):
-                elem_0 = group * 4
-                elem_1 = elem_0 + 1
-                elem_2 = elem_0 + 2
-                elem_3 = elem_0 + 3
-                _, col_0 = score_coords[elem_0]
-                _, col_1 = score_coords[elem_1]
-                mask_0 = (
-                    cutlass.Float32(
-                        shared_broadcast_mask[0, col_0, key_value_slot]
+            output_accumulator.fill(0.0)
+            running_max_0 = cutlass.Float32(float("-inf"))
+            running_max_1 = cutlass.Float32(float("-inf"))
+            running_sum_0 = cutlass.Float32(0.0)
+            running_sum_1 = cutlass.Float32(0.0)
+
+            for key_block in cutlass.range(num_key_blocks):
+                pipeline_block = task_iteration * num_key_blocks + key_block
+                stage = pipeline_block % KEY_VALUE_STAGES
+                key_value_slot = consumer_warpgroup * KEY_VALUE_STAGES + stage
+                full_phase = (pipeline_block // KEY_VALUE_STAGES) % 2
+                pair_bias_stage = pipeline_block % PAIR_BIAS_STAGES
+                pair_bias_phase = (pipeline_block // PAIR_BIAS_STAGES) % 2
+
+                cute.arch.mbarrier_wait(key_value_ready + stage, full_phase)
+                # Diagonal FA3 ping-pong. WG1's QK(k) follows WG0's QK(k).
+                # Later, WG1's PV(k) waits for WG0's QK(k+1), allowing the
+                # latter to overlap WG1's softmax(k). The arrive/wait counts
+                # balance within each task, so the pattern restarts per task.
+                if (
+                    n_ctx != SHORT_SEQUENCE_LENGTH
+                    and consumer_warpgroup == 1
+                    and key_block == 0
+                ):
+                    qk0_to_qk1.arrive_and_wait()
+                score_mma.set(Field.ACCUMULATE, False)
+                cute.nvgpu.warpgroup.fence()
+                cute.gemm(
+                    score_mma,
+                    score_fragment,
+                    query_fragment[None, None, None, query_slot],
+                    key_fragment[None, None, None, key_value_slot],
+                    score_fragment,
+                )
+                cute.nvgpu.warpgroup.commit_group()
+                cute.nvgpu.warpgroup.wait_group(0)
+                # The last QK of a task is the last read of its Q slot.
+                if key_block == num_key_blocks - 1:
+                    if warpgroup_thread_idx == 0:
+                        cute.arch.mbarrier_arrive(query_free + query_buffer)
+                if n_ctx != SHORT_SEQUENCE_LENGTH:
+                    if consumer_warpgroup == 0:
+                        qk0_to_qk1.arrive()
+                    else:
+                        qk1_to_pv0.arrive()
+                cute.arch.mbarrier_wait(
+                    pair_bias_ready + pair_bias_stage, pair_bias_phase
+                )
+                cute.copy(
+                    pair_bias_tiled_copy,
+                    pair_bias_thread_copy.partition_S(
+                        shared_pair_bias_row_col[None, None, pair_bias_stage]
+                    ),
+                    pair_bias_bf16_retile,
+                )
+                pair_bias_fragment.store(pair_bias_bf16.load().to(cutlass.Float32))
+                if warpgroup_thread_idx % 32 == 0:
+                    cute.arch.mbarrier_arrive(pair_bias_free + pair_bias_stage)
+
+                local_max_0 = cutlass.Float32(float("-inf"))
+                local_max_1 = cutlass.Float32(float("-inf"))
+                # e and e+2 own the same key column for the two query rows in
+                # a four-lane WGMMA quartet.  Load the zero-stride broadcast
+                # mask once per column and fold the additive work into the
+                # max pass.
+                for group in cutlass.range_constexpr(cute.size(score_fragment) // 4):
+                    elem_0 = group * 4
+                    elem_1 = elem_0 + 1
+                    elem_2 = elem_0 + 2
+                    elem_3 = elem_0 + 3
+                    _, col_0 = score_coords[elem_0]
+                    _, col_1 = score_coords[elem_1]
+                    mask_0 = (
+                        cutlass.Float32(
+                            shared_broadcast_mask[0, col_0, key_value_slot]
+                        )
+                        - 1.0
+                    ) * 1.0e9
+                    mask_1 = (
+                        cutlass.Float32(
+                            shared_broadcast_mask[0, col_1, key_value_slot]
+                        )
+                        - 1.0
+                    ) * 1.0e9
+                    score_0 = (
+                        score_fragment[elem_0] * SOFTMAX_SCALE
+                        + pair_bias_fragment[elem_0]
+                        + mask_0
                     )
-                    - 1.0
-                ) * 1.0e9
-                mask_1 = (
-                    cutlass.Float32(
-                        shared_broadcast_mask[0, col_1, key_value_slot]
+                    score_1 = (
+                        score_fragment[elem_1] * SOFTMAX_SCALE
+                        + pair_bias_fragment[elem_1]
+                        + mask_1
                     )
-                    - 1.0
-                ) * 1.0e9
-                score_0 = (
-                    score_fragment[elem_0] * SOFTMAX_SCALE
-                    + pair_bias_fragment[elem_0]
-                    + mask_0
+                    score_2 = (
+                        score_fragment[elem_2] * SOFTMAX_SCALE
+                        + pair_bias_fragment[elem_2]
+                        + mask_0
+                    )
+                    score_3 = (
+                        score_fragment[elem_3] * SOFTMAX_SCALE
+                        + pair_bias_fragment[elem_3]
+                        + mask_1
+                    )
+                    score_fragment[elem_0] = score_0
+                    score_fragment[elem_1] = score_1
+                    score_fragment[elem_2] = score_2
+                    score_fragment[elem_3] = score_3
+                    local_max_0 = cute.arch.fmax(local_max_0, score_0)
+                    local_max_0 = cute.arch.fmax(local_max_0, score_1)
+                    local_max_1 = cute.arch.fmax(local_max_1, score_2)
+                    local_max_1 = cute.arch.fmax(local_max_1, score_3)
+                local_max_0 = cute.arch.fmax(
+                    local_max_0, cute.arch.shuffle_sync_bfly(local_max_0, offset=1)
                 )
-                score_1 = (
-                    score_fragment[elem_1] * SOFTMAX_SCALE
-                    + pair_bias_fragment[elem_1]
-                    + mask_1
+                local_max_0 = cute.arch.fmax(
+                    local_max_0, cute.arch.shuffle_sync_bfly(local_max_0, offset=2)
                 )
-                score_2 = (
-                    score_fragment[elem_2] * SOFTMAX_SCALE
-                    + pair_bias_fragment[elem_2]
-                    + mask_0
+                local_max_1 = cute.arch.fmax(
+                    local_max_1, cute.arch.shuffle_sync_bfly(local_max_1, offset=1)
                 )
-                score_3 = (
-                    score_fragment[elem_3] * SOFTMAX_SCALE
-                    + pair_bias_fragment[elem_3]
-                    + mask_1
+                local_max_1 = cute.arch.fmax(
+                    local_max_1, cute.arch.shuffle_sync_bfly(local_max_1, offset=2)
                 )
-                score_fragment[elem_0] = score_0
-                score_fragment[elem_1] = score_1
-                score_fragment[elem_2] = score_2
-                score_fragment[elem_3] = score_3
-                local_max_0 = cutlass.max(local_max_0, score_0)
-                local_max_0 = cutlass.max(local_max_0, score_1)
-                local_max_1 = cutlass.max(local_max_1, score_2)
-                local_max_1 = cutlass.max(local_max_1, score_3)
-            local_max_0 = cutlass.max(
-                local_max_0, cute.arch.shuffle_sync_bfly(local_max_0, offset=1)
-            )
-            local_max_0 = cutlass.max(
-                local_max_0, cute.arch.shuffle_sync_bfly(local_max_0, offset=2)
-            )
-            local_max_1 = cutlass.max(
-                local_max_1, cute.arch.shuffle_sync_bfly(local_max_1, offset=1)
-            )
-            local_max_1 = cutlass.max(
-                local_max_1, cute.arch.shuffle_sync_bfly(local_max_1, offset=2)
-            )
 
-            new_max_0 = cutlass.max(running_max_0, local_max_0)
-            new_max_1 = cutlass.max(running_max_1, local_max_1)
-            alpha_0 = cutlass.Float32(0.0)
-            alpha_1 = cutlass.Float32(0.0)
-            if warpgroup_thread_idx % 4 == 0:
-                alpha_0 = cute.math.exp(running_max_0 - new_max_0, fastmath=True)
-                alpha_1 = cute.math.exp(running_max_1 - new_max_1, fastmath=True)
-            alpha_0 = cute.arch.shuffle_sync(alpha_0, 0, mask_and_clamp=0x1C03)
-            alpha_1 = cute.arch.shuffle_sync(alpha_1, 0, mask_and_clamp=0x1C03)
-            local_sum_0 = cutlass.Float32(0.0)
-            local_sum_1 = cutlass.Float32(0.0)
-            for elem in cutlass.range_constexpr(cute.size(score_fragment)):
-                probability = cutlass.Float32(0.0)
-                if elem % 4 < 2:
-                    exponent = score_fragment[elem] - new_max_0
-                    probability = cute.math.exp(exponent, fastmath=True)
-                    local_sum_0 += probability
-                else:
-                    exponent = score_fragment[elem] - new_max_1
-                    probability = cute.math.exp(exponent, fastmath=True)
-                    local_sum_1 += probability
-                score_fragment[elem] = probability
+                new_max_0 = cute.arch.fmax(running_max_0, local_max_0)
+                new_max_1 = cute.arch.fmax(running_max_1, local_max_1)
+                alpha_0 = cutlass.Float32(0.0)
+                alpha_1 = cutlass.Float32(0.0)
+                if warpgroup_thread_idx % 4 == 0:
+                    alpha_0 = cute.math.exp(running_max_0 - new_max_0, fastmath=True)
+                    alpha_1 = cute.math.exp(running_max_1 - new_max_1, fastmath=True)
+                alpha_0 = cute.arch.shuffle_sync(alpha_0, 0, mask_and_clamp=0x1C03)
+                alpha_1 = cute.arch.shuffle_sync(alpha_1, 0, mask_and_clamp=0x1C03)
+                local_sum_0 = cutlass.Float32(0.0)
+                local_sum_1 = cutlass.Float32(0.0)
+                for elem in cutlass.range_constexpr(cute.size(score_fragment)):
+                    probability = cutlass.Float32(0.0)
+                    if elem % 4 < 2:
+                        exponent = score_fragment[elem] - new_max_0
+                        probability = cute.math.exp(exponent, fastmath=True)
+                        local_sum_0 += probability
+                    else:
+                        exponent = score_fragment[elem] - new_max_1
+                        probability = cute.math.exp(exponent, fastmath=True)
+                        local_sum_1 += probability
+                    score_fragment[elem] = probability
 
-            local_sum_0 += cute.arch.shuffle_sync_bfly(local_sum_0, offset=1)
-            local_sum_0 += cute.arch.shuffle_sync_bfly(local_sum_0, offset=2)
-            local_sum_1 += cute.arch.shuffle_sync_bfly(local_sum_1, offset=1)
-            local_sum_1 += cute.arch.shuffle_sync_bfly(local_sum_1, offset=2)
-            running_sum_0 = running_sum_0 * alpha_0 + local_sum_0
-            running_sum_1 = running_sum_1 * alpha_1 + local_sum_1
-            running_max_0 = new_max_0
-            running_max_1 = new_max_1
-            probability_fragment.store(score_fragment.load().to(cutlass.BFloat16))
+                local_sum_0 += cute.arch.shuffle_sync_bfly(local_sum_0, offset=1)
+                local_sum_0 += cute.arch.shuffle_sync_bfly(local_sum_0, offset=2)
+                local_sum_1 += cute.arch.shuffle_sync_bfly(local_sum_1, offset=1)
+                local_sum_1 += cute.arch.shuffle_sync_bfly(local_sum_1, offset=2)
+                running_sum_0 = running_sum_0 * alpha_0 + local_sum_0
+                running_sum_1 = running_sum_1 * alpha_1 + local_sum_1
+                running_max_0 = new_max_0
+                running_max_1 = new_max_1
+                probability_fragment.store(score_fragment.load().to(cutlass.BFloat16))
 
-            if n_ctx != SHORT_SEQUENCE_LENGTH:
-                if consumer_warpgroup == 0:
-                    qk1_to_pv0.arrive_and_wait()
-                else:
-                    if key_block + 1 < num_key_blocks:
-                        qk0_to_qk1.arrive_and_wait()
-            for elem in cutlass.range_constexpr(cute.size(output_accumulator)):
-                output_accumulator[elem] *= alpha_0 if elem % 4 < 2 else alpha_1
+                if n_ctx != SHORT_SEQUENCE_LENGTH:
+                    if consumer_warpgroup == 0:
+                        qk1_to_pv0.arrive_and_wait()
+                    else:
+                        if key_block + 1 < num_key_blocks:
+                            qk0_to_qk1.arrive_and_wait()
+                for elem in cutlass.range_constexpr(cute.size(output_accumulator)):
+                    output_accumulator[elem] *= alpha_0 if elem % 4 < 2 else alpha_1
 
-            output_mma.set(Field.ACCUMULATE, True)
-            cute.nvgpu.warpgroup.fence()
-            cute.gemm(
-                output_mma,
-                output_accumulator,
-                probability_fragment,
-                value_fragment[None, None, None, key_value_slot],
-                output_accumulator,
-            )
-            cute.nvgpu.warpgroup.commit_group()
-            cute.nvgpu.warpgroup.wait_group(0)
-            if n_ctx != SHORT_SEQUENCE_LENGTH:
+                output_mma.set(Field.ACCUMULATE, True)
+                cute.nvgpu.warpgroup.fence()
+                cute.gemm(
+                    output_mma,
+                    output_accumulator,
+                    probability_fragment,
+                    value_fragment[None, None, None, key_value_slot],
+                    output_accumulator,
+                )
+                cute.nvgpu.warpgroup.commit_group()
+                cute.nvgpu.warpgroup.wait_group(0)
                 if warpgroup_thread_idx == 0:
                     cute.arch.mbarrier_arrive(key_value_free + stage)
-            key_block += 1
 
-        inv_sum_0 = cutlass.Float32(0.0)
-        inv_sum_1 = cutlass.Float32(0.0)
-        if warpgroup_thread_idx % 4 == 0:
-            inv_sum_0 = cute.arch.rcp_approx(running_sum_0)
-            inv_sum_1 = cute.arch.rcp_approx(running_sum_1)
-        inv_sum_0 = cute.arch.shuffle_sync(inv_sum_0, 0, mask_and_clamp=0x1C03)
-        inv_sum_1 = cute.arch.shuffle_sync(inv_sum_1, 0, mask_and_clamp=0x1C03)
-        for elem in cutlass.range_constexpr(cute.size(output_accumulator)):
-            output_accumulator[elem] *= inv_sum_0 if elem % 4 < 2 else inv_sum_1
-        output_bf16 = cute.make_fragment_like(output_accumulator, cutlass.BFloat16)
-        output_bf16.store(output_accumulator.load().to(cutlass.BFloat16))
-        output_retile = output_register_copy.retile(output_bf16)
-        cute.copy(output_register_copy, output_retile, output_partition)
-        if warpgroup_thread_idx % 4 == 0:
-            sequence_idx = sequence_0 + consumer_warpgroup
-            lse[
-                query_base + first_row, head_idx, sequence_idx, batch_idx
-            ] = running_max_0 + cute.math.log(running_sum_0, fastmath=True)
-            lse[
-                query_base + second_row, head_idx, sequence_idx, batch_idx
-            ] = running_max_1 + cute.math.log(running_sum_1, fastmath=True)
-        cute.arch.fence_proxy("async.shared", space="cta")
-        cute.arch.barrier(
-            barrier_id=OUTPUT_READY_BARRIER_ID,
-            number_of_threads=CONSUMER_THREAD_COUNT,
-        )
-        if consumer_warpgroup == 0 and warpgroup_thread_idx < 32:
-            remote_store_rows = REMOTE_STORE_ROWS
+            inv_sum_0 = cutlass.Float32(0.0)
+            inv_sum_1 = cutlass.Float32(0.0)
+            if warpgroup_thread_idx % 4 == 0:
+                inv_sum_0 = cute.arch.rcp_approx(running_sum_0)
+                inv_sum_1 = cute.arch.rcp_approx(running_sum_1)
+            inv_sum_0 = cute.arch.shuffle_sync(inv_sum_0, 0, mask_and_clamp=0x1C03)
+            inv_sum_1 = cute.arch.shuffle_sync(inv_sum_1, 0, mask_and_clamp=0x1C03)
+            for elem in cutlass.range_constexpr(cute.size(output_accumulator)):
+                output_accumulator[elem] *= inv_sum_0 if elem % 4 < 2 else inv_sum_1
+            output_bf16 = cute.make_fragment_like(output_accumulator, cutlass.BFloat16)
+            output_bf16.store(output_accumulator.load().to(cutlass.BFloat16))
+            output_retile = output_register_copy.retile(output_bf16)
+            output_buffer = task_iteration % OUTPUT_BUFFERS
+            output_use = task_iteration // OUTPUT_BUFFERS
+            if output_use > 0:
+                # Wait until the epilogue warp's TMA stores from this buffer's
+                # previous use have read it.
+                cute.arch.mbarrier_wait(
+                    output_empty + output_buffer, (output_use - 1) % 2
+                )
+            shared_output_consumer = cute.local_tile(
+                shared_output_mn,
+                (QUERY_TILE_SIZE, HEAD_DIMENSION),
+                (output_buffer * CONSUMER_WARPGROUP_COUNT + consumer_warpgroup, 0),
+            )
+            output_partition = thread_copy_c.partition_D(shared_output_consumer)
+            cute.copy(output_register_copy, output_retile, output_partition)
+            if warpgroup_thread_idx % 4 == 0:
+                sequence_idx = sequence_0 + consumer_warpgroup
+                lse[
+                    query_base + first_row, head_idx, sequence_idx, batch_idx
+                ] = running_max_0 + cute.math.log(running_sum_0, fastmath=True)
+                lse[
+                    query_base + second_row, head_idx, sequence_idx, batch_idx
+                ] = running_max_1 + cute.math.log(running_sum_1, fastmath=True)
+            # Make generic-proxy smem writes visible to the TMA (async proxy),
+            # then hand the tile to the epilogue warp without waiting.
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.mbarrier_arrive(output_full + output_buffer)
+
+    else:
+        # Warp EPILOGUE_WARP_INDEX: output TMA stores, residual all-to-all and
+        # the cross-PE completion protocol. Never participates in WGMMA.
+        lane = thread_idx - EPILOGUE_WARP_INDEX * 32
+        residual_count = cutlass.Int32(0)
+        for task_iteration in cutlass.range(task_iterations):
+            task = linear_block + task_iteration * cta_count
+            query_block, head_idx, sequence_0, batch_idx = _decode_task(
+                task, query_blocks, heads, sequence_pairs
+            )
+            output_buffer = task_iteration % OUTPUT_BUFFERS
+            output_use = task_iteration // OUTPUT_BUFFERS
+
+            cute.arch.mbarrier_wait(output_full + output_buffer, output_use % 2)
             _store_remote_output_chunk(
                 local_output_tma,
                 local_output_tensor,
@@ -896,16 +1055,15 @@ def _evoattention_forward_kernel(
                 head_idx,
                 sequence_0,
                 batch_idx,
+                output_buffer,
             )
-            for chunk in cutlass.range_constexpr(
-                QUERY_TILE_SIZE // remote_store_rows
-            ):
+            for chunk in cutlass.range_constexpr(RESIDUAL_CHUNKS):
                 global_query = (
-                    query_block * QUERY_TILE_SIZE + chunk * remote_store_rows
+                    query_block * QUERY_TILE_SIZE + chunk * REMOTE_STORE_ROWS
                 )
                 destination = global_query // sequence_count
                 local_query = global_query - destination * sequence_count
-                local_query_block = local_query // remote_store_rows
+                local_query_block = local_query // REMOTE_STORE_ROWS
                 for peer in cutlass.range_constexpr(world_size):
                     if destination == peer:
                         _store_remote_output_chunk(
@@ -913,50 +1071,26 @@ def _evoattention_forward_kernel(
                             output_tensors[peer],
                             shared_output,
                             chunk,
-                            remote_store_rows,
+                            REMOTE_STORE_ROWS,
                             local_query_block,
                             head_idx,
                             sequence_0,
                             batch_idx,
+                            output_buffer,
                         )
             cute.arch.cp_async_bulk_commit_group()
-            cute.arch.cp_async_bulk_wait_group(0)
-            if head_idx == 0:
-                for chunk in cutlass.range_constexpr(
-                    QUERY_TILE_SIZE // remote_store_rows
-                ):
-                    global_query_block = (
-                        query_block * QUERY_TILE_SIZE
-                        + chunk * remote_store_rows
-                    ) // remote_store_rows
-                    destination = (
-                        query_block * QUERY_TILE_SIZE
-                        + chunk * remote_store_rows
-                    ) // sequence_count
-                    local_query = (
-                        query_block * QUERY_TILE_SIZE
-                        + chunk * remote_store_rows
-                        - destination * sequence_count
+
+            # Residual chunks owned by this task (same ownership rule as the
+            # producer).
+            for chunk in cutlass.range_constexpr(RESIDUAL_CHUNKS):
+                if cutlass.Int32(chunk) % heads == head_idx:
+                    global_query = (
+                        query_block * QUERY_TILE_SIZE + chunk * REMOTE_STORE_ROWS
                     )
-                    local_query_block = local_query // remote_store_rows
-                    if warpgroup_thread_idx == 0:
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            query_ready,
-                            2
-                            * RESIDUAL_DIMENSION
-                            * remote_store_rows
-                            * 2,
-                        )
-                    _load_residual_chunk(
-                        residual_input_tma,
-                        residual_input_tensor,
-                        shared_residual_input,
-                        global_query_block,
-                        sequence_0,
-                        batch_idx,
-                        query_ready,
-                    )
-                    cute.arch.mbarrier_wait(query_ready, (chunk + 1) % 2)
+                    destination = global_query // sequence_count
+                    local_query = global_query - destination * sequence_count
+                    local_query_block = local_query // REMOTE_STORE_ROWS
+                    cute.arch.mbarrier_wait(residual_full, residual_count % 2)
                     for peer in cutlass.range_constexpr(world_size):
                         if destination == peer:
                             _store_remote_residual_chunk(
@@ -968,40 +1102,52 @@ def _evoattention_forward_kernel(
                                 batch_idx,
                             )
                     cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0)
-            if warpgroup_thread_idx == 0:
-                cute.arch.fence_proxy("async.global")
-                completed_before = cute.arch.atomic_add(
-                    completion_counter.iterator,
-                    cutlass.Int32(1),
-                    sem="acq_rel",
-                    scope="gpu",
-                )
-                total_ctas = query_blocks * sequence_pairs * batch * heads
-                if completed_before == completion_epoch * total_ctas - 1:
-                    cute.arch.fence_acq_rel_sys()
-                    for peer in cutlass.range_constexpr(world_size):
-                        cute.arch.store(
-                            completion_peers[peer].iterator,
-                            completion_epoch,
-                            sem="release",
-                            scope="sys",
-                        )
-                    for source in cutlass.range_constexpr(world_size):
-                        signal = cute.domain_offset((source,), completion)
+                    # Release the residual tile once its stores have read it.
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    if lane == 0:
+                        cute.arch.mbarrier_arrive(residual_empty)
+                    residual_count += 1
+
+            # Release this output buffer once every store has read it.
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            if lane == 0:
+                cute.arch.mbarrier_arrive(output_empty + output_buffer)
+
+        # All of this CTA's output/residual stores must be globally complete
+        # before it publishes completion (once per CTA).
+        cute.arch.cp_async_bulk_wait_group(0)
+        if lane == 0:
+            cute.arch.fence_proxy("async.global")
+            completed_before = cute.arch.atomic_add(
+                completion_counter.iterator,
+                cutlass.Int32(1),
+                sem="acq_rel",
+                scope="gpu",
+            )
+            if completed_before == completion_epoch * cta_count - 1:
+                cute.arch.fence_acq_rel_sys()
+                for peer in cutlass.range_constexpr(world_size):
+                    cute.arch.store(
+                        completion_peers[peer].iterator,
+                        completion_epoch,
+                        sem="release",
+                        scope="sys",
+                    )
+                for source in cutlass.range_constexpr(world_size):
+                    signal = cute.domain_offset((source,), completion)
+                    observed = cute.arch.load(
+                        signal.iterator,
+                        cutlass.Int32,
+                        sem="acquire",
+                        scope="sys",
+                    )
+                    while observed < completion_epoch:
                         observed = cute.arch.load(
                             signal.iterator,
                             cutlass.Int32,
                             sem="acquire",
                             scope="sys",
                         )
-                        while observed < completion_epoch:
-                            observed = cute.arch.load(
-                                signal.iterator,
-                                cutlass.Int32,
-                                sem="acquire",
-                                scope="sys",
-                            )
 
 
 @cute.jit
@@ -1042,13 +1188,9 @@ def _build_and_launch_forward(
     completion_epoch: cutlass.Int32,
     lse: cute.Tensor,
     world_size: cutlass.Constexpr[int],
+    cta_count: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
-    batch = q.shape[0]
-    sequence_count = q.shape[1]
-    n_ctx = q.shape[2]
-    heads = q.shape[3]
-    problem_count = batch * sequence_count * heads
 
     score_mma = sm90_utils.make_trivial_tiled_mma(
         cutlass.BFloat16,
@@ -1082,7 +1224,7 @@ def _build_and_launch_forward(
         LayoutEnum.ROW_MAJOR,
         (QUERY_TILE_SIZE, QUERY_TILE_SIZE, HEAD_DIMENSION),
         a_dtype=cutlass.BFloat16,
-        num_stages=2,
+        num_stages=CONSUMER_WARPGROUP_COUNT * QUERY_BUFFERS,
     )
     key_layout = sm90_utils.make_smem_layout_b(
         LayoutEnum.ROW_MAJOR,
@@ -1232,7 +1374,7 @@ def _build_and_launch_forward(
     )
     output_layout = cute.tile_to_shape(
         output_layout_atom,
-        (HEAD_DIMENSION, CTA_OUTPUT_ROW_SLOTS),
+        (HEAD_DIMENSION, CTA_OUTPUT_ROW_SLOTS * OUTPUT_BUFFERS),
         order=(1, 0),
     )
     output_tma_layout = cute.tile_to_shape(
@@ -1434,15 +1576,9 @@ def _build_and_launch_forward(
         output_mma,
         output_register_copy,
         world_size,
+        cta_count,
     ).launch(
-        # Flatten the work grid into x: grid.y is limited to 65535, while the
-        # largest target has P=B*S*H=65536 before accounting for query tiles.
-        grid=(
-            (n_ctx // QUERY_TILE_SIZE)
-            * (problem_count // CONSUMER_WARPGROUP_COUNT),
-            1,
-            1,
-        ),
+        grid=(cta_count, 1, 1),
         block=(THREADS_PER_BLOCK, 1, 1),
         min_blocks_per_mp=1,
         stream=stream,
@@ -1453,8 +1589,8 @@ class DistributedEvoAttentionForward:
     """Compile one distributed forward specialization for a fixed world size."""
 
     def __init__(self, world_size: int, source_rank: int) -> None:
-        if world_size not in (2, 4, 8):
-            raise ValueError(f"world_size must be 2, 4, or 8, got {world_size}")
+        if world_size not in (1, 2, 4, 8):
+            raise ValueError(f"world_size must be 1, 2, 4, or 8, got {world_size}")
         self.world_size = world_size
         if not 0 <= source_rank < world_size:
             raise ValueError(
@@ -1690,6 +1826,8 @@ class DistributedEvoAttentionForward:
             completion_epoch,
             _as_dynamic_tensor(lse, (0, 1, 2, 3), alignment=16, tiled_modes=(3,)),
             self.world_size,
+            CTAS_PER_SM
+            * torch.cuda.get_device_properties(q.device).multi_processor_count,
             stream,
         )
 
@@ -1777,6 +1915,7 @@ class DistributedEvoAttentionForward:
                     self._compile_count += 1
 
         self._compiled(*arguments, cuda_stream)
+
 
 _FORWARD_KERNELS: dict[tuple[int, int], DistributedEvoAttentionForward] = {}
 

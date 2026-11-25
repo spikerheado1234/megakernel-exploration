@@ -14,13 +14,11 @@ import triton
 import triton.language as tl
 
 
-DEFAULT_REFERENCE_PATH = Path(
-    "/home/ahangupta/MegaFold/megafold/model/FusedEvoAttention/evoattention.py"
-)
+DEFAULT_REFERENCE_PATH = Path("/home/ahangupta/Debug/MegaFold/debug/evoattention.py")
 
 
 def load_reference_module() -> ModuleType:
-    """Load the authoritative MegaFold Triton implementation."""
+    """Load MegaFold's Triton EvoAttention (``TritonEvoformer`` autograd op)."""
     reference_path = Path(
         os.environ.get("EVOATTENTION_REFERENCE", DEFAULT_REFERENCE_PATH)
     )
@@ -47,172 +45,11 @@ def _convert_mask(source, destination, count, BLOCK_SIZE: tl.constexpr):
     tl.store(destination + offsets, tl.where(values != 0, 0.0, -1.0e9), mask=active)
 
 
-def launch_triton_forward(
-    reference: ModuleType,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    pair_bias_source: torch.Tensor,
-    residual_mask: torch.Tensor,
-    query_workspace: torch.Tensor,
-    key_workspace: torch.Tensor,
-    value_workspace: torch.Tensor,
-    pair_bias_workspace: torch.Tensor,
-    mask_workspace: torch.Tensor,
-    output_workspace: torch.Tensor,
-    output: torch.Tensor,
-    logsumexp: torch.Tensor,
-) -> None:
-    """Prepare model-layout inputs and launch the Triton forward baseline."""
-    query_workspace.copy_(query.transpose(2, 3))
-    key_workspace.copy_(key.transpose(2, 3))
-    value_workspace.copy_(value.transpose(2, 3))
-    pair_bias_workspace.copy_(pair_bias_source)
-    mask_count = mask_workspace.numel()
+def convert_mask(residual_mask: torch.Tensor, additive_mask: torch.Tensor) -> None:
+    """Convert a 0/1 residual mask into the additive ``0 / -1e9`` Triton mask."""
+    mask_count = additive_mask.numel()
     _convert_mask[(triton.cdiv(mask_count, 256),)](
-        residual_mask, mask_workspace, mask_count, BLOCK_SIZE=256
-    )
-
-    batch, sequence_count, heads, context_length, head_dimension = (
-        query_workspace.shape
-    )
-    reference._attn_fwd[
-        (triton.cdiv(context_length, 16), batch * sequence_count * heads, 1)
-    ](
-        Q=query_workspace,
-        K=key_workspace,
-        V=value_workspace,
-        res_mask=mask_workspace,
-        pair_bias=pair_bias_workspace,
-        softmax_scale=head_dimension**-0.5,
-        M=logsumexp,
-        O=output_workspace,
-        stride_Q_batch=query_workspace.stride(0),
-        stride_Q_msa=query_workspace.stride(1),
-        stride_Q_head=query_workspace.stride(2),
-        stride_Q_seq=query_workspace.stride(3),
-        stride_Q_dim=query_workspace.stride(4),
-        stride_K_batch=key_workspace.stride(0),
-        stride_K_msa=key_workspace.stride(1),
-        stride_K_head=key_workspace.stride(2),
-        stride_K_seq=key_workspace.stride(3),
-        stride_K_dim=key_workspace.stride(4),
-        stride_V_batch=value_workspace.stride(0),
-        stride_V_msa=value_workspace.stride(1),
-        stride_V_head=value_workspace.stride(2),
-        stride_V_seq=value_workspace.stride(3),
-        stride_V_dim=value_workspace.stride(4),
-        stride_O_batch=output_workspace.stride(0),
-        stride_O_msa=output_workspace.stride(1),
-        stride_O_head=output_workspace.stride(2),
-        stride_O_seq=output_workspace.stride(3),
-        stride_O_dim=output_workspace.stride(4),
-        stride_pair_bias_batch=pair_bias_workspace.stride(0),
-        stride_pair_bias_head=pair_bias_workspace.stride(1),
-        stride_pair_bias_seq1=pair_bias_workspace.stride(2),
-        stride_pair_bias_seq2=pair_bias_workspace.stride(3),
-        stride_mask_batch=mask_workspace.stride(0),
-        stride_mask_msa=mask_workspace.stride(1),
-        stride_mask_seq=mask_workspace.stride(2),
-        BATCH_SIZE=batch,
-        HEAD=heads,
-        N_SEQ=sequence_count,
-        SEQ_LEN=context_length,
-        DIM=head_dimension,
-        BLOCK_DIM=max(triton.next_power_of_2(head_dimension), 16),
-        BLOCK_SIZE_Q=16,
-        BLOCK_SIZE_KV=64,
-        num_stages=3,
-        num_warps=4,
-    )
-    output.copy_(output_workspace.transpose(2, 3))
-
-
-def launch_triton_backward(
-    reference: ModuleType,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    output_gradient: torch.Tensor,
-    pair_bias: torch.Tensor,
-    residual_mask: torch.Tensor,
-    logsumexp: torch.Tensor,
-    delta: torch.Tensor,
-    query_gradient: torch.Tensor,
-    key_gradient: torch.Tensor,
-    value_gradient: torch.Tensor,
-    pair_bias_gradient: torch.Tensor,
-) -> None:
-    """Launch every kernel in the authoritative Triton backward path."""
-    batch, sequence_count, heads, context_length, head_dimension = query.shape
-    problem_count = batch * sequence_count * heads
-    pair_bias_gradient.zero_()
-    reference._attn_bwd_preprocess[
-        (triton.cdiv(context_length, 32), problem_count, 1)
-    ](
-        O=output,
-        dO=output_gradient,
-        D=delta,
-        SEQ_LEN=context_length,
-        DIM=head_dimension,
-        BLOCK_DIM=head_dimension,
-        BLOCK_SIZE_Q=32,
-        num_stages=2,
-        num_warps=4,
-    )
-    common_arguments = dict(
-        Q=query,
-        K=key,
-        V=value,
-        res_mask=residual_mask,
-        pair_bias=pair_bias,
-        softmax_scale=head_dimension**-0.5,
-        dO=output_gradient,
-        dQ=query_gradient,
-        dK=key_gradient,
-        dV=value_gradient,
-        M=logsumexp,
-        D=delta,
-        stride_batch=query.stride(0),
-        stride_msa=query.stride(1),
-        stride_head=query.stride(2),
-        stride_seq=query.stride(3),
-        stride_pair_bias_batch=pair_bias.stride(0),
-        stride_pair_bias_head=pair_bias.stride(1),
-        stride_pair_bias_seq1=pair_bias.stride(2),
-        stride_pair_bias_seq2=pair_bias.stride(3),
-        stride_mask_batch=residual_mask.stride(0),
-        stride_mask_msa=residual_mask.stride(1),
-        stride_mask_seq=residual_mask.stride(2),
-        HEAD=heads,
-        N_SEQ=sequence_count,
-        SEQ_LEN=context_length,
-        BLOCK_DIM=head_dimension,
-        DIM=head_dimension,
-    )
-    reference._attn_bwd_dk_dv[
-        (triton.cdiv(context_length, 16), problem_count, 1)
-    ](
-        **common_arguments,
-        BLOCK_SIZE_Q=64,
-        BLOCK_SIZE_KV=16,
-        num_stages=3,
-        num_warps=4,
-    )
-    reference._attn_bwd_dq[
-        (triton.cdiv(context_length, 16), problem_count, 1)
-    ](
-        **common_arguments,
-        d_pair_bias=pair_bias_gradient,
-        stride_d_pair_bias_batch=pair_bias_gradient.stride(0),
-        stride_d_pair_bias_head=pair_bias_gradient.stride(1),
-        stride_d_pair_bias_seq1=pair_bias_gradient.stride(2),
-        stride_d_pair_bias_seq2=pair_bias_gradient.stride(3),
-        BLOCK_SIZE_Q=16,
-        BLOCK_SIZE_KV=64,
-        num_stages=3,
-        num_warps=4,
+        residual_mask, additive_mask, mask_count, BLOCK_SIZE=256
     )
 
 
@@ -293,8 +130,7 @@ def measure_distributed(
 
 __all__ = [
     "column_to_row",
-    "launch_triton_backward",
-    "launch_triton_forward",
+    "convert_mask",
     "load_reference_module",
     "measure_distributed",
     "row_to_column",
